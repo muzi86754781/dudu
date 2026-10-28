@@ -786,6 +786,8 @@ fn capture_start_with_state<R: tauri::Runtime>(
 
     if let Some(existing) = app.get_webview_window("capture") {
         log_info!("capture", "复用现有截图窗口，立即显示并重聚焦点");
+        let _ = existing.set_fullscreen(true);
+        let _ = existing.set_position(tauri::LogicalPosition::new(0.0, 0.0));
         let _ = existing.show();
         let _ = existing.unminimize();
         let _ = existing.set_focus();
@@ -928,30 +930,47 @@ fn capture_output(
             let _ = app.emit("ocr-text", text);
         }
         "pin" => {
-            *state.capture.write().map_err(err)? = Some(image.to_rgba8());
-            *state.capture_cache.write().map_err(err)? = Some(Capture {
+            log_info!("capture", "Pin requested: {}x{}, data bytes: {}", w, h, data.len());
+            let cap = Capture {
                 data: data.clone(),
                 width: w,
                 height: h,
-            });
-            if let Some(w) = app.get_webview_window("pin-1") {
-                let _ = w.hide();
-                let _ = w.destroy();
+            };
+            *state.capture.write().map_err(err)? = Some(image.to_rgba8());
+            *state.capture_cache.write().map_err(err)? = Some(cap.clone());
+
+            let pin_w = (w.clamp(200, 1400)) as f64;
+            let pin_h = ((h + 40).clamp(160, 1000)) as f64;
+
+            if let Some(existing) = app.get_webview_window("pin-1") {
+                log_info!("capture", "复用现有贴图窗口 pin-1");
+                let _ = existing.set_size(tauri::LogicalSize::new(pin_w, pin_h));
+                let _ = existing.show();
+                let _ = existing.unminimize();
+                let _ = existing.set_focus();
+                let _ = app.emit("pin-data", cap);
+            } else {
+                log_info!("capture", "创建全新贴图窗口 pin-1");
+                let url = WebviewUrl::App("index.html?pin=1".into());
+                let win = WebviewWindowBuilder::new(&app, "pin-1", url)
+                    .title("dudu 贴图")
+                    .decorations(false)
+                    .always_on_top(true)
+                    .skip_taskbar(true)
+                    .inner_size(pin_w, pin_h)
+                    .center()
+                    .build()
+                    .map_err(err)?;
+                let _ = win.show();
+                let _ = win.set_focus();
             }
-            let url = WebviewUrl::App("index.html?pin=1".into());
-            WebviewWindowBuilder::new(&app, "pin-1", url)
-                .title("dudu 贴图")
-                .decorations(false)
-                .always_on_top(true)
-                .skip_taskbar(true)
-                .inner_size((w.min(1200)) as f64, (h.min(900)) as f64)
-                .build()
-                .map_err(err)?;
         }
         _ => return Err("未知图片操作".into()),
     }
     if let Some(w) = app.get_webview_window("capture") {
         let _ = w.hide();
+        let _ = w.set_fullscreen(true);
+        let _ = w.set_position(tauri::LogicalPosition::new(0.0, 0.0));
     }
     Ok(())
 }
@@ -1001,6 +1020,50 @@ fn cancel_capture(app: tauri::AppHandle) -> Result<()> {
     log_info!("capture", "用户取消/退出截图工作台");
     if let Some(w) = app.get_webview_window("capture") {
         let _ = w.hide();
+        let _ = w.set_fullscreen(true);
+        let _ = w.set_position(tauri::LogicalPosition::new(0.0, 0.0));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn set_long_capture_mode(
+    app: tauri::AppHandle,
+    enabled: bool,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> Result<()> {
+    let Some(capture_win) = app.get_webview_window("capture") else {
+        return Ok(());
+    };
+    if enabled {
+        let monitors = xcap::Monitor::all().map_err(err)?;
+        let primary = monitors
+            .iter()
+            .find(|m| m.is_primary().unwrap_or(false))
+            .unwrap_or(&monitors[0]);
+        let screen_w = primary.width() as f64;
+
+        let hud_w = 380.0;
+        let hud_h = 720.0;
+        let hud_x = if (x + width / 2) as f64 > screen_w / 2.0 {
+            24.0
+        } else {
+            (screen_w - hud_w - 24.0).max(10.0)
+        };
+        let hud_y = 60.0;
+
+        log_info!("capture", "进入长截图控制台模式: 位置=({}, {}), 尺寸=({}, {})", hud_x, hud_y, hud_w, hud_h);
+        let _ = capture_win.set_fullscreen(false);
+        let _ = capture_win.set_size(tauri::LogicalSize::new(hud_w, hud_h));
+        let _ = capture_win.set_position(tauri::LogicalPosition::new(hud_x, hud_y));
+        let _ = capture_win.set_always_on_top(true);
+    } else {
+        log_info!("capture", "退出长截图模式，截图窗口重置为全屏");
+        let _ = capture_win.set_fullscreen(true);
+        let _ = capture_win.set_position(tauri::LogicalPosition::new(0.0, 0.0));
     }
     Ok(())
 }
@@ -1046,11 +1109,14 @@ fn scroll_and_capture_slice(
     width: u32,
     height: u32,
 ) -> Result<Capture> {
-    let mut e = Enigo::new(&InputSettings::default()).map_err(err)?;
-    let _ = e.scroll(delta, Axis::Vertical);
-
-    // Sleep briefly so target application can repaint the scrolled content
-    std::thread::sleep(std::time::Duration::from_millis(160));
+    if delta != 0 {
+        let mut e = Enigo::new(&InputSettings::default()).map_err(err)?;
+        let center_x = (x + width / 2) as i32;
+        let center_y = (y + height / 2) as i32;
+        let _ = e.move_location(center_x, center_y, enigo::Coordinate::Abs);
+        let _ = e.scroll(delta, Axis::Vertical);
+        std::thread::sleep(std::time::Duration::from_millis(180));
+    }
 
     let monitors = xcap::Monitor::all().map_err(err)?;
     let primary = monitors
@@ -1725,6 +1791,7 @@ pub fn run() {
             drag_window,
             capture_color,
             cancel_capture,
+            set_long_capture_mode,
             scroll_target_page,
             scroll_and_capture_slice,
             hide_main,

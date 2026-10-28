@@ -20,6 +20,10 @@ import {
   Copy,
   Sparkles,
   ScrollText,
+  Play,
+  Pause,
+  ChevronDown,
+  Camera,
 } from 'lucide-react';
 import { call, on } from './bridge';
 import { normalizedRect, rgbToHex, type Capture } from './model';
@@ -128,7 +132,49 @@ function PinViewer() {
   const [zoom, setZoom] = useState(1);
 
   useEffect(() => {
-    void call<Capture>('pending_capture').then(setCapture).catch(() => {});
+    let mounted = true;
+    void call<Capture>('pending_capture')
+      .then(c => {
+        if (mounted && c && c.data) {
+          void call('frontend_log', {
+            level: 'INFO',
+            tag: 'pin_ui',
+            message: `PinViewer loaded pending_capture: ${c.width}x${c.height}`,
+          });
+          setCapture(c);
+        }
+      })
+      .catch(err => {
+        void call('frontend_log', {
+          level: 'ERROR',
+          tag: 'pin_ui',
+          message: `pending_capture failed: ${err}`,
+        });
+      });
+
+    const unlisten = on<Capture>('pin-data', c => {
+      if (mounted && c && c.data) {
+        void call('frontend_log', {
+          level: 'INFO',
+          tag: 'pin_ui',
+          message: `PinViewer received pin-data event: ${c.width}x${c.height}`,
+        });
+        setCapture(c);
+      }
+    });
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        void call('close_pin');
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+
+    return () => {
+      mounted = false;
+      void unlisten.then(f => f());
+      window.removeEventListener('keydown', handleKeyDown);
+    };
   }, []);
 
   return (
@@ -202,11 +248,11 @@ function PinViewer() {
       </div>
 
       <div className="pin-image-wrapper">
-        {capture ? (
+        {capture?.data ? (
           <img
             src={capture.data}
             alt="置顶贴图"
-            style={{ width: `${zoom * 100}%` }}
+            style={{ transform: `scale(${zoom})`, transformOrigin: 'center center' }}
             draggable={false}
           />
         ) : (
@@ -241,6 +287,7 @@ function CaptureScreen({ mode }: { mode: string }) {
   const [isLongCapturing, setIsLongCapturing] = useState(false);
   const [longPageCount, setLongPageCount] = useState(1);
   const [longPreviewUrl, setLongPreviewUrl] = useState<string | null>(null);
+  const [longHistory, setLongHistory] = useState<string[]>([]);
   const [autoScrolling, setAutoScrolling] = useState(false);
   const [lastDragY, setLastDragY] = useState<number | null>(null);
 
@@ -250,6 +297,7 @@ function CaptureScreen({ mode }: { mode: string }) {
   const loupeCanvasRef = useRef<HTMLCanvasElement>(null);
   const probeCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const longCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const inlineInputRef = useRef<HTMLInputElement>(null);
   const autoScrollTimer = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
@@ -474,8 +522,52 @@ function CaptureScreen({ mode }: { mode: string }) {
     ctx.strokeRect(centerStart, centerStart, cellSize, cellSize);
   }, [crop, hoverPoint]);
 
-  // 9. Callbacks for Long Screenshot
-  const startLongCapture = useCallback(() => {
+  // 9. Inline Text Annotation Commit
+  const commitInlineText = useCallback(() => {
+    if (textAt && textInput.trim()) {
+      setShapes(prev => [
+        ...prev,
+        {
+          tool: 'text',
+          points: [textAt],
+          text: textInput.trim(),
+          color,
+          width,
+        },
+      ]);
+      setRedo([]);
+    }
+    setTextAt(null);
+    setTextInput('');
+  }, [textAt, textInput, color, width]);
+
+  // Guaranteed Offscreen Cropped Data Generator (eliminates blank images)
+  const getCroppedDataUrl = useCallback((): string | null => {
+    if (isLongCapturing && longCanvasRef.current) {
+      return longCanvasRef.current.toDataURL('image/png');
+    }
+    if (!crop) return null;
+    const offscreen = document.createElement('canvas');
+    offscreen.width = crop.width;
+    offscreen.height = crop.height;
+    const ctx = offscreen.getContext('2d');
+    if (!ctx) return null;
+
+    if (imageRef.current) {
+      const sx = Math.max(0, Math.min(imageRef.current.width - crop.width, crop.x));
+      const sy = Math.max(0, Math.min(imageRef.current.height - crop.height, crop.y));
+      const sw = Math.min(crop.width, imageRef.current.width - sx);
+      const sh = Math.min(crop.height, imageRef.current.height - sy);
+      ctx.drawImage(imageRef.current, sx, sy, sw, sh, 0, 0, crop.width, crop.height);
+    }
+    for (const s of shapes) {
+      drawShape(ctx, s);
+    }
+    return offscreen.toDataURL('image/png');
+  }, [crop, shapes, isLongCapturing]);
+
+  // 10. Callbacks for Long Screenshot
+  const startLongCapture = useCallback(async () => {
     if (!crop || !imageRef.current) return;
     setIsLongCapturing(true);
     setLongPageCount(1);
@@ -485,10 +577,12 @@ function CaptureScreen({ mode }: { mode: string }) {
     c.height = crop.height;
     const ctx = c.getContext('2d');
     if (ctx && imageRef.current) {
+      const sx = Math.max(0, Math.min(imageRef.current.width - crop.width, crop.x));
+      const sy = Math.max(0, Math.min(imageRef.current.height - crop.height, crop.y));
       ctx.drawImage(
         imageRef.current,
-        crop.x,
-        crop.y,
+        sx,
+        sy,
         crop.width,
         crop.height,
         0,
@@ -497,10 +591,73 @@ function CaptureScreen({ mode }: { mode: string }) {
         crop.height
       );
       longCanvasRef.current = c;
-      setLongPreviewUrl(c.toDataURL('image/png'));
+      const initialUrl = c.toDataURL('image/png');
+      setLongPreviewUrl(initialUrl);
+      setLongHistory([initialUrl]);
     }
-    showToast('长截图已开启：滚动鼠标滚轮 或 向下拖拽页面实时拼接');
+
+    try {
+      await call('set_long_capture_mode', {
+        enabled: true,
+        x: Math.round(crop.x),
+        y: Math.round(crop.y),
+        width: Math.round(crop.width),
+        height: Math.round(crop.height),
+      });
+    } catch {
+      // fallback
+    }
+    showToast('长截图已开启：滚轮滚动页面 或 点击自动滚动');
   }, [crop, showToast]);
+
+  const finishLongCapture = useCallback(async () => {
+    clearInterval(autoScrollTimer.current);
+    setAutoScrolling(false);
+    try {
+      await call('set_long_capture_mode', { enabled: false, x: 0, y: 0, width: 0, height: 0 });
+    } catch {
+      // ignore
+    }
+    setIsLongCapturing(false);
+    if (!longCanvasRef.current) return;
+    const dataUrl = longCanvasRef.current.toDataURL('image/png');
+    await call('capture_output', { data: dataUrl, action: 'copy' });
+  }, []);
+
+  const cancelLongCapture = useCallback(async () => {
+    clearInterval(autoScrollTimer.current);
+    setAutoScrolling(false);
+    try {
+      await call('set_long_capture_mode', { enabled: false, x: 0, y: 0, width: 0, height: 0 });
+    } catch {
+      // ignore
+    }
+    setIsLongCapturing(false);
+    void call('cancel_capture');
+  }, []);
+
+  const undoLongSlice = useCallback(() => {
+    if (longHistory.length <= 1) return;
+    const newHist = longHistory.slice(0, -1);
+    const prevUrl = newHist[newHist.length - 1];
+    setLongHistory(newHist);
+    setLongPreviewUrl(prevUrl);
+    setLongPageCount(prev => Math.max(1, prev - 1));
+
+    const img = new Image();
+    img.onload = () => {
+      const c = document.createElement('canvas');
+      c.width = img.width;
+      c.height = img.height;
+      const ctx = c.getContext('2d');
+      if (ctx) {
+        ctx.drawImage(img, 0, 0);
+        longCanvasRef.current = c;
+      }
+    };
+    img.src = prevUrl;
+    showToast('已撤销上一截拼接');
+  }, [longHistory, showToast]);
 
   const stitchNewSlice = useCallback(
     (newSliceImg: HTMLImageElement) => {
@@ -510,55 +667,99 @@ function CaptureScreen({ mode }: { mode: string }) {
       const H1 = prevCanvas.height;
       const H2 = newSliceImg.height;
 
-      const maxOverlap = Math.min(H2 - 20, Math.floor(H2 * 0.7));
-      const minOverlap = 20;
-      let bestOverlap = Math.floor(H2 * 0.35);
+      const prevCtx = prevCanvas.getContext('2d');
+      const sliceCanvas = document.createElement('canvas');
+      sliceCanvas.width = W;
+      sliceCanvas.height = H2;
+      const sliceCtx = sliceCanvas.getContext('2d');
+      if (!prevCtx || !sliceCtx) return;
 
-      try {
-        const prevCtx = prevCanvas.getContext('2d');
-        const sliceCanvas = document.createElement('canvas');
-        sliceCanvas.width = W;
-        sliceCanvas.height = H2;
-        const sliceCtx = sliceCanvas.getContext('2d');
-        if (prevCtx && sliceCtx) {
-          sliceCtx.drawImage(newSliceImg, 0, 0);
+      sliceCtx.drawImage(newSliceImg, 0, 0);
 
-          let minDiff = Infinity;
-          for (let candidate = minOverlap; candidate <= maxOverlap; candidate += 4) {
-            const row1 = prevCtx.getImageData(0, H1 - candidate, Math.min(W, 80), 1).data;
-            const row2 = sliceCtx.getImageData(0, 0, Math.min(W, 80), 1).data;
-            let diff = 0;
-            for (let i = 0; i < row1.length; i += 4) {
-              diff +=
-                Math.abs(row1[i] - row2[i]) +
-                Math.abs(row1[i + 1] - row2[i + 1]) +
-                Math.abs(row1[i + 2] - row2[i + 2]);
-            }
-            if (diff < minDiff) {
-              minDiff = diff;
-              bestOverlap = candidate;
-            }
-          }
+      // 1. Select a feature template band with high contrast (text/graphics)
+      const bandH = 20;
+      let bestTplY = 0;
+      let maxBandVariance = -1;
+
+      const sampleCols = 40;
+      const colStep = Math.max(1, Math.floor((W * 0.8) / sampleCols));
+      const colStart = Math.floor(W * 0.1);
+
+      for (let testY = 0; testY <= Math.floor(H2 * 0.35); testY += 6) {
+        const imgData = sliceCtx.getImageData(colStart, testY, colStep * sampleCols, bandH).data;
+        let minVal = 255;
+        let maxVal = 0;
+        for (let i = 0; i < imgData.length; i += 16) {
+          const gray = (imgData[i] + imgData[i + 1] + imgData[i + 2]) / 3;
+          if (gray < minVal) minVal = gray;
+          if (gray > maxVal) maxVal = gray;
         }
-      } catch {
-        // fallback
+        const variance = maxVal - minVal;
+        if (variance > maxBandVariance) {
+          maxBandVariance = variance;
+          bestTplY = testY;
+          if (variance > 80) break;
+        }
       }
 
-      const appendHeight = Math.max(30, H2 - bestOverlap);
-      const newTotalHeight = H1 + appendHeight;
+      const tplY = bestTplY;
+      const tplData = sliceCtx.getImageData(colStart, tplY, colStep * sampleCols, bandH).data;
 
+      // 2. Search for overlap candidate V in prevCanvas
+      const minV = Math.max(30, Math.floor(H2 * 0.1));
+      const maxV = H2;
+      let bestV = Math.floor(H2 * 0.5);
+      let minMae = Infinity;
+
+      for (let candidateV = minV; candidateV <= maxV; candidateV += 2) {
+        const prevY = H1 - candidateV + tplY;
+        if (prevY < 0 || prevY + bandH > H1) continue;
+
+        const prevData = prevCtx.getImageData(colStart, prevY, colStep * sampleCols, bandH).data;
+        let sumDiff = 0;
+        let count = 0;
+
+        for (let i = 0; i < tplData.length; i += 12) {
+          sumDiff +=
+            Math.abs(tplData[i] - prevData[i]) +
+            Math.abs(tplData[i + 1] - prevData[i + 1]) +
+            Math.abs(tplData[i + 2] - prevData[i + 2]);
+          count += 3;
+        }
+
+        const mae = sumDiff / count;
+        if (mae < minMae) {
+          minMae = mae;
+          bestV = candidateV;
+        }
+      }
+
+      // 3. Duplicate or bottom of page check
+      if (bestV >= H2 - 8 && minMae < 15) {
+        showToast('内容未变化，已滚动到底部');
+        return;
+      }
+
+      // 4. Calculate append height
+      const appendHeight = H2 - bestV;
+      if (appendHeight <= 4) {
+        return;
+      }
+
+      // 5. Append new content to canvas
       const newCanvas = document.createElement('canvas');
       newCanvas.width = W;
-      newCanvas.height = Math.min(18000, newTotalHeight);
+      newCanvas.height = Math.min(25000, H1 + appendHeight);
       const newCtx = newCanvas.getContext('2d');
       if (!newCtx) return;
 
       newCtx.drawImage(prevCanvas, 0, 0);
-      newCtx.drawImage(newSliceImg, 0, bestOverlap, W, appendHeight, 0, H1, W, appendHeight);
+      newCtx.drawImage(newSliceImg, 0, bestV, W, appendHeight, 0, H1, W, appendHeight);
 
       longCanvasRef.current = newCanvas;
-      const url = newCanvas.toDataURL('image/png');
-      setLongPreviewUrl(url);
+      const dataUrl = newCanvas.toDataURL('image/png');
+      setLongPreviewUrl(dataUrl);
+      setLongHistory(prev => [...prev.slice(-12), dataUrl]);
       setLongPageCount(prev => prev + 1);
 
       if (canvasRef.current) {
@@ -568,7 +769,7 @@ function CaptureScreen({ mode }: { mode: string }) {
         if (cCtx) cCtx.drawImage(newCanvas, 0, 0);
       }
     },
-    [crop]
+    [crop, showToast]
   );
 
   const triggerScrollAndStitch = useCallback(
@@ -596,17 +797,6 @@ function CaptureScreen({ mode }: { mode: string }) {
     },
     [crop, busy, stitchNewSlice]
   );
-
-  const finishLongCapture = useCallback(async () => {
-    clearInterval(autoScrollTimer.current);
-    setAutoScrolling(false);
-    if (!longCanvasRef.current) {
-      setIsLongCapturing(false);
-      return;
-    }
-    const dataUrl = longCanvasRef.current.toDataURL('image/png');
-    await call('capture_output', { data: dataUrl, action: 'copy' });
-  }, []);
 
   // Ensure window keyboard focus
   useEffect(() => {
@@ -811,12 +1001,16 @@ function CaptureScreen({ mode }: { mode: string }) {
     setResizeStart(null);
   };
 
-  // Output action triggers
+  // Output action triggers (uses reliable offscreen canvas to guarantee non-empty image)
   const handleOutput = async (action: string) => {
-    if (!canvasRef.current || busy) return;
+    if (busy) return;
+    const dataUrl = getCroppedDataUrl();
+    if (!dataUrl) {
+      showToast('未选择有效截图区域');
+      return;
+    }
     setBusy(true);
     try {
-      const dataUrl = canvasRef.current.toDataURL('image/png');
       await call('capture_output', { data: dataUrl, action });
     } catch (e) {
       showToast((e as Error).message || '操作失败');
@@ -827,10 +1021,11 @@ function CaptureScreen({ mode }: { mode: string }) {
 
   // Perform translation directly on crop
   const handleTranslate = async () => {
-    if (!canvasRef.current || busy) return;
+    if (busy) return;
+    const dataUrl = getCroppedDataUrl();
+    if (!dataUrl) return;
     setBusy(true);
     try {
-      const dataUrl = canvasRef.current.toDataURL('image/png');
       await call('capture_output', { data: dataUrl, action: 'ocr' });
       void call('cancel_capture');
     } catch (e) {
@@ -870,6 +1065,115 @@ function CaptureScreen({ mode }: { mode: string }) {
         >
           取消退出 (Esc)
         </button>
+      </div>
+    );
+  }
+
+  // Long Capture Console Mode (Docked floating panel at screen edge)
+  if (isLongCapturing) {
+    return (
+      <div className="long-capture-console" onContextMenu={e => e.preventDefault()}>
+        <div className="long-console-header" data-tauri-drag-region>
+          <div className="long-console-title">
+            <ScrollText size={18} color="#22c55e" />
+            <div>
+              <strong>长截图控制台</strong>
+              <span className="long-console-meta">
+                第 {longPageCount} 屏 · {crop?.width || 0} × {longCanvasRef.current?.height || crop?.height || 0} px
+              </span>
+            </div>
+          </div>
+          <button
+            className="long-console-close"
+            onClick={() => void cancelLongCapture()}
+            title="退出长截图 (Esc)"
+          >
+            <X size={16} />
+          </button>
+        </div>
+
+        <div className="long-console-tip">
+          提示：直接在目标页面滚轮滚动，或点击下方【自动滚动】/【向下截取】
+        </div>
+
+        <div className="long-console-actions">
+          <button
+            className={`long-btn primary ${autoScrolling ? 'active' : ''}`}
+            onClick={() => {
+              if (autoScrolling) {
+                clearInterval(autoScrollTimer.current);
+                setAutoScrolling(false);
+              } else {
+                setAutoScrolling(true);
+                autoScrollTimer.current = setInterval(() => {
+                  void triggerScrollAndStitch(-3);
+                }, 550);
+              }
+            }}
+          >
+            {autoScrolling ? <Pause size={15} /> : <Play size={15} />}
+            {autoScrolling ? '暂停自动滚动' : '自动向下滚动'}
+          </button>
+
+          <div className="long-btn-row">
+            <button
+              className="long-btn secondary"
+              disabled={busy}
+              onClick={() => void triggerScrollAndStitch(-3)}
+              title="目标页面向下滚动一段并实时拼接"
+            >
+              <ChevronDown size={15} /> 向下滚动截取
+            </button>
+            <button
+              className="long-btn secondary"
+              disabled={busy}
+              onClick={() => void triggerScrollAndStitch(0)}
+              title="不滚动，直接截取当前页面画面并拼接"
+            >
+              <Camera size={15} /> 截取当前
+            </button>
+          </div>
+
+          <div className="long-btn-row">
+            <button
+              className="long-btn secondary"
+              disabled={longHistory.length <= 1 || busy}
+              onClick={undoLongSlice}
+              title="撤销上一段拼接 (Ctrl+Z)"
+            >
+              <Undo2 size={15} /> 撤销上一段
+            </button>
+            <button
+              className="long-btn success"
+              disabled={busy}
+              onClick={() => void finishLongCapture()}
+              title="完成长截图并复制到剪贴板 (Enter)"
+            >
+              <Check size={15} /> 完成并复制
+            </button>
+          </div>
+        </div>
+
+        <div
+          className="long-console-preview"
+          onWheel={e => {
+            e.preventDefault();
+            if (e.deltaY > 0 && !busy) {
+              void triggerScrollAndStitch(-3);
+            }
+          }}
+        >
+          <div className="preview-label">实时拼接长图预览 (滚轮向下可触发拼接)：</div>
+          {longPreviewUrl ? (
+            <div className="preview-img-container">
+              <img src={longPreviewUrl} alt="长截图预览" draggable={false} />
+            </div>
+          ) : (
+            <div className="preview-placeholder">正在准备第一屏…</div>
+          )}
+        </div>
+
+        {toast && <div className="screen-toast">{toast}</div>}
       </div>
     );
   }
@@ -1098,6 +1402,44 @@ function CaptureScreen({ mode }: { mode: string }) {
             }
           }}
         />
+
+        {/* Inline Text Annotation Input (Directly where user clicked) */}
+        {textAt && (
+          <div
+            className="inline-text-wrapper"
+            style={{
+              left: `${(textAt.x / crop.width) * 100}%`,
+              top: `${(textAt.y / crop.height) * 100}%`,
+            }}
+            onPointerDown={e => e.stopPropagation()}
+          >
+            <input
+              ref={inlineInputRef}
+              autoFocus
+              type="text"
+              className="inline-annotation-input"
+              style={{
+                color,
+                fontSize: `${Math.max(14, (width * 5 * cropW) / crop.width)}px`,
+                caretColor: color,
+              }}
+              placeholder="输入文字，按 Enter 完成"
+              value={textInput}
+              onChange={e => setTextInput(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  commitInlineText();
+                } else if (e.key === 'Escape') {
+                  e.preventDefault();
+                  setTextAt(null);
+                  setTextInput('');
+                }
+              }}
+              onBlur={commitInlineText}
+            />
+          </div>
+        )}
 
         {/* 8-Point Resize Handles (Circles from Fig 2) */}
         {!activeTool && (
@@ -1334,97 +1676,6 @@ function CaptureScreen({ mode }: { mode: string }) {
         </button>
       </div>
 
-      {/* Long Screenshot Control Banner */}
-      {isLongCapturing && (
-        <div className="long-capture-banner" onPointerDown={e => e.stopPropagation()}>
-          <span className="long-badge">长截图模式 · 第 {longPageCount} 屏</span>
-          <span>鼠标滚轮滚动 或 鼠标按住左键向下拖动页面实时拼接</span>
-          <button
-            className="long-action-btn"
-            onClick={() => {
-              if (autoScrolling) {
-                clearInterval(autoScrollTimer.current);
-                setAutoScrolling(false);
-              } else {
-                setAutoScrolling(true);
-                autoScrollTimer.current = setInterval(() => {
-                  void triggerScrollAndStitch(-3);
-                }, 450);
-              }
-            }}
-          >
-            {autoScrolling ? '暂停滚动' : '自动滚动'}
-          </button>
-          <button className="long-action-btn finish-btn" onClick={() => void finishLongCapture()}>
-            <Check size={14} /> 完成长截图并复制 (Enter)
-          </button>
-          <button
-            className="long-action-btn"
-            onClick={() => {
-              clearInterval(autoScrollTimer.current);
-              setAutoScrolling(false);
-              setIsLongCapturing(false);
-            }}
-            title="退出长截图"
-          >
-            <X size={14} />
-          </button>
-        </div>
-      )}
-
-      {/* Long Screenshot Live Preview Drawer */}
-      {isLongCapturing && longPreviewUrl && (
-        <div className="long-preview-drawer" onPointerDown={e => e.stopPropagation()}>
-          <div className="long-preview-header">
-            <span>长截图实时预览</span>
-            <span>
-              {crop.width} × {longCanvasRef.current?.height || crop.height} px
-            </span>
-          </div>
-          <div className="long-preview-body">
-            <img src={longPreviewUrl} alt="长截图预览" draggable={false} />
-          </div>
-        </div>
-      )}
-
-      {/* Modal for Text Annotation Input */}
-      {textAt && (
-        <div className="modal-backdrop">
-          <section className="modal">
-            <h2>添加文字标注</h2>
-            <textarea
-              autoFocus
-              className="edit-content"
-              placeholder="输入标注文字…"
-              value={textInput}
-              onChange={e => setTextInput(e.target.value)}
-            />
-            <div className="modal-actions">
-              <button className="secondary" onClick={() => setTextAt(null)}>
-                取消
-              </button>
-              <button
-                className="primary"
-                onClick={() => {
-                  if (textInput.trim()) {
-                    addShape({
-                      tool: 'text',
-                      points: [textAt],
-                      text: textInput,
-                      color,
-                      width,
-                    });
-                  }
-                  setTextAt(null);
-                }}
-              >
-                确定
-              </button>
-            </div>
-          </section>
-        </div>
-      )}
-
       {toast && <div className="screen-toast">{toast}</div>}
     </div>
   );
@@ -1479,7 +1730,10 @@ function drawShape(ctx: CanvasRenderingContext2D, s: Shape) {
     }
     ctx.stroke();
   } else if (s.tool === 'text') {
-    ctx.font = `600 ${Math.max(16, s.width * 5)}px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
+    ctx.textBaseline = 'top';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = s.color;
+    ctx.font = `600 ${Math.max(16, s.width * 5)}px -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif`;
     s.text?.split('\n').forEach((line, i) => {
       ctx.fillText(line, a.x, a.y + i * Math.max(22, s.width * 6));
     });

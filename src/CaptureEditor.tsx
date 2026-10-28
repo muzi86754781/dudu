@@ -1,37 +1,31 @@
-import { useEffect, useRef, useState, useMemo } from 'react';
+import React, { useEffect, useRef, useState, useMemo, useCallback } from 'react';
 import {
-  Copy,
+  Square,
+  Circle,
+  ArrowUpRight,
+  Pen,
+  Grid2X2,
+  Type,
+  Hash,
+  Undo2,
+  ScanLine,
+  Languages,
+  Pin,
   Download,
   X,
-  Undo2,
-  Redo2,
-  Pin,
-  Type,
-  ArrowUpRight,
-  Square,
-  Pen,
-  Highlighter,
-  Hash,
-  Grid2X2,
-  ScanLine,
-  Code,
+  Check,
   Move,
   Minus,
   Plus,
-  Circle,
-  Slash,
-  QrCode,
-  Languages,
-  Check,
-  Maximize2,
-  ExternalLink,
-  Layers,
+  Copy,
+  Sparkles,
 } from 'lucide-react';
-import jsQR from 'jsqr';
 import { call } from './bridge';
-import { normalizedRect, rgbToHex, type Capture } from './model';
+import { normalizedRect, rgbToHex, hexToRgb, type Capture } from './model';
 
 type Point = { x: number; y: number };
+type Rect = { x: number; y: number; width: number; height: number };
+
 type Shape = {
   tool: string;
   points: Point[];
@@ -41,33 +35,57 @@ type Shape = {
   index?: number;
 };
 
+const PRESET_COLORS = [
+  '#ef4444', // 红
+  '#f97316', // 橙
+  '#eab308', // 黄
+  '#22c55e', // 绿
+  '#06b6d4', // 青
+  '#3b82f6', // 蓝
+  '#8b5cf6', // 紫
+  '#ffffff', // 白
+  '#000000', // 黑
+];
+
+const PRESET_WIDTHS = [2, 4, 8];
+
 export default function CaptureEditor({ mode }: { mode: string }) {
   const [capture, setCapture] = useState<Capture | null>(null);
-  const [crop, setCrop] = useState<{ x: number; y: number; width: number; height: number } | null>(null);
-  const [tool, setTool] = useState('arrow');
-  const [color, setColor] = useState('#ef5454');
+  const [crop, setCrop] = useState<Rect | null>(null);
+  const [activeTool, setActiveTool] = useState<string | null>(null);
+  const [color, setColor] = useState('#ef4444');
   const [width, setWidth] = useState(4);
   const [shapes, setShapes] = useState<Shape[]>([]);
   const [redo, setRedo] = useState<Shape[]>([]);
   const [drawing, setDrawing] = useState<Shape | null>(null);
-  const [origin, setOrigin] = useState<Point | null>(null);
-  const [end, setEnd] = useState<Point | null>(null);
+  const [dragOrigin, setDragOrigin] = useState<Point | null>(null);
+  const [dragCurrent, setDragCurrent] = useState<Point | null>(null);
   const [hoverPoint, setHoverPoint] = useState<Point | null>(null);
-  const [error, setError] = useState('');
+  const [resizingHandle, setResizingHandle] = useState<string | null>(null);
+  const [resizeStart, setResizeStart] = useState<{ mouse: Point; crop: Rect } | null>(null);
+  const [colorFormat, setColorFormat] = useState<'hex' | 'rgb'>('hex');
+  const [toast, setToast] = useState('');
   const [busy, setBusy] = useState(false);
+  const [textAt, setTextAt] = useState<Point | null>(null);
+  const [textInput, setTextInput] = useState('');
+  const [showColorPalette, setShowColorPalette] = useState(false);
+
+  // Pin window properties
   const [opacity, setOpacity] = useState(1);
   const [zoom, setZoom] = useState(1);
-  const [textAt, setTextAt] = useState<Point | null>(null);
-  const [text, setText] = useState('');
-  const [detectedQr, setDetectedQr] = useState<string | null>(null);
-  const [showToolbar, setShowToolbar] = useState(true);
-  const [stitchImages, setStitchImages] = useState<string[]>([]);
-  const [copiedHint, setCopiedHint] = useState('');
 
-  const canvas = useRef<HTMLCanvasElement>(null);
-  const image = useRef<HTMLImageElement | null>(null);
-  const selection = useRef<HTMLDivElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const imageRef = useRef<HTMLImageElement | null>(null);
+  const loupeCanvasRef = useRef<HTMLCanvasElement>(null);
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
+  const showToast = (msg: string) => {
+    setToast(msg);
+    clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(''), 2200);
+  };
+
+  // Load pending capture data
   useEffect(() => {
     void call<Capture>('pending_capture')
       .then(c => {
@@ -77,20 +95,26 @@ export default function CaptureEditor({ mode }: { mode: string }) {
         }
         const img = new Image();
         img.onload = () => {
-          image.current = img;
-          render();
+          imageRef.current = img;
+          renderAnnotations();
         };
         img.src = c.data;
       })
-      .catch(e => setError(e.message));
-  }, []);
+      .catch(e => showToast(e.message));
+  }, [mode]);
 
-  function render() {
-    const ctx = canvas.current?.getContext('2d');
-    if (!ctx || !crop || !image.current) return;
+  // Render annotations onto crop canvas
+  const renderAnnotations = useCallback(() => {
+    const canvas = canvasRef.current;
+    const img = imageRef.current;
+    if (!canvas || !crop || !img) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
     ctx.clearRect(0, 0, crop.width, crop.height);
+    // Draw cropped portion from original image
     ctx.drawImage(
-      image.current,
+      img,
       crop.x,
       crop.y,
       crop.width,
@@ -100,206 +124,309 @@ export default function CaptureEditor({ mode }: { mode: string }) {
       crop.width,
       crop.height
     );
+
+    // Draw saved and in-progress shapes
     for (const s of [...shapes, ...(drawing ? [drawing] : [])]) {
-      draw(ctx, s);
+      drawShape(ctx, s);
     }
-  }
+  }, [crop, shapes, drawing]);
 
   useEffect(() => {
-    render();
-  }, [capture, crop, shapes, drawing]);
+    renderAnnotations();
+  }, [renderAnnotations]);
 
-  // QR Code detection on crop change
-  useEffect(() => {
-    if (!crop || !image.current) return;
+  // Current hover pixel color details for loupe
+  const hoverPixelInfo = useMemo(() => {
+    if (!capture || !hoverPoint || !imageRef.current) return null;
     try {
-      const c = document.createElement('canvas');
-      c.width = crop.width;
-      c.height = crop.height;
-      const ctx = c.getContext('2d');
-      if (ctx) {
-        ctx.drawImage(
-          image.current,
-          crop.x,
-          crop.y,
-          crop.width,
-          crop.height,
-          0,
-          0,
-          crop.width,
-          crop.height
-        );
-        const imgData = ctx.getImageData(0, 0, crop.width, crop.height);
-        const code = jsQR(imgData.data, imgData.width, imgData.height);
-        if (code && code.data) {
-          setDetectedQr(code.data);
-        } else {
-          setDetectedQr(null);
-        }
-      }
-    } catch {
-      setDetectedQr(null);
-    }
-  }, [crop]);
-
-  function add(shape: Shape) {
-    setShapes(prev => [...prev, shape].slice(-100));
-    setRedo([]);
-  }
-
-  function undo() {
-    setShapes(prev => {
-      if (!prev.length) return prev;
-      setRedo(r => [...r, prev[prev.length - 1]]);
-      return prev.slice(0, -1);
-    });
-  }
-
-  function redoOne() {
-    setRedo(prev => {
-      if (!prev.length) return prev;
-      setShapes(s => [...s, prev[prev.length - 1]]);
-      return prev.slice(0, -1);
-    });
-  }
-
-  useEffect(() => {
-    const f = (e: KeyboardEvent) => {
-      if ((e.target as HTMLElement).matches('input,textarea')) return;
-      if (e.key === 'Escape') void call('cancel_capture');
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
-        e.preventDefault();
-        if (e.shiftKey) redoOne();
-        else undo();
-      }
-      const tools: Record<string, string> = {
-        a: 'arrow',
-        l: 'line',
-        r: 'rect',
-        e: 'ellipse',
-        p: 'pen',
-        t: 'text',
-        m: 'mosaic',
-        h: 'highlight',
-        n: 'number',
-      };
-      if (!e.ctrlKey && !e.metaKey && tools[e.key.toLowerCase()]) {
-        setTool(tools[e.key.toLowerCase()]);
-      }
-    };
-    window.addEventListener('keydown', f);
-    return () => window.removeEventListener('keydown', f);
-  }, []);
-
-  function point(e: React.PointerEvent, el: HTMLElement, w: number, h: number): Point {
-    const r = el.getBoundingClientRect();
-    return {
-      x: Math.max(0, Math.min(w, ((e.clientX - r.left) * w) / r.width)),
-      y: Math.max(0, Math.min(h, ((e.clientY - r.top) * h) / r.height)),
-    };
-  }
-
-  async function output(action: string) {
-    if (!canvas.current || busy) return;
-    setBusy(true);
-    setError('');
-    try {
-      const dataUrl = canvas.current.toDataURL('image/png');
-      if (action === 'markdown') {
-        await call('write_text', { text: `![截图](${dataUrl})` });
-        setCopiedHint('已复制 Markdown');
-        setTimeout(() => setCopiedHint(''), 2000);
-        return;
-      }
-      if (action === 'stitch_add') {
-        setStitchImages(prev => [...prev, dataUrl]);
-        setCopiedHint(`已加入长截图拼接队列 (${stitchImages.length + 1} 屏)`);
-        setTimeout(() => setCopiedHint(''), 2500);
-        return;
-      }
-      await call('capture_output', { data: dataUrl, action });
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  // Magnifying glass info for color picker
-  const hoverColor = useMemo(() => {
-    if (!capture || !hoverPoint || !image.current) return null;
-    try {
-      const c = document.createElement('canvas');
-      c.width = capture.width;
-      c.height = capture.height;
-      const ctx = c.getContext('2d');
+      const offscreen = document.createElement('canvas');
+      offscreen.width = capture.width;
+      offscreen.height = capture.height;
+      const ctx = offscreen.getContext('2d');
       if (!ctx) return null;
-      ctx.drawImage(image.current, 0, 0);
+      ctx.drawImage(imageRef.current, 0, 0);
+
       const pxX = Math.min(capture.width - 1, Math.max(0, Math.floor(hoverPoint.x)));
       const pxY = Math.min(capture.height - 1, Math.max(0, Math.floor(hoverPoint.y)));
       const d = ctx.getImageData(pxX, pxY, 1, 1).data;
       const hex = rgbToHex(d[0], d[1], d[2]);
-      const intVal = (d[0] << 16) + (d[1] << 8) + d[2];
-      return { hex, r: d[0], g: d[1], b: d[2], intVal, pxX, pxY };
+      const rgb = `RGB(${d[0]}, ${d[1]}, ${d[2]})`;
+      return { pxX, pxY, hex, rgb, r: d[0], g: d[1], b: d[2] };
     } catch {
       return null;
     }
   }, [capture, hoverPoint]);
 
-  // Floating Action Bar position
-  const floatingBarStyle = useMemo(() => {
-    if (!crop || !capture) return {};
-    const bottomY = (crop.y + crop.height) / capture.height;
-    const isNearBottom = bottomY > 0.82;
-    return {
-      left: `${Math.max(5, Math.min(95, (crop.x + crop.width / 2) / capture.width * 100))}%`,
-      top: isNearBottom
-        ? `${Math.max(4, (crop.y / capture.height) * 100 - 6)}%`
-        : `${Math.min(96, ((crop.y + crop.height) / capture.height) * 100 + 3)}%`,
-      transform: 'translateX(-50%)',
-    };
-  }, [crop, capture]);
+  // Render 15x15 pixel grid onto magnifier loupe
+  useEffect(() => {
+    if (crop || !hoverPoint || !imageRef.current || !loupeCanvasRef.current) return;
+    const loupe = loupeCanvasRef.current;
+    const ctx = loupe.getContext('2d');
+    if (!ctx) return;
 
-  // Stitch images vertically
-  async function completeStitch() {
-    if (!stitchImages.length && !canvas.current) return;
-    const all = [...stitchImages, ...(canvas.current ? [canvas.current.toDataURL('image/png')] : [])];
-    if (all.length === 0) return;
+    const img = imageRef.current;
+    const pxX = Math.floor(hoverPoint.x);
+    const pxY = Math.floor(hoverPoint.y);
+
+    ctx.imageSmoothingEnabled = false;
+    ctx.clearRect(0, 0, loupe.width, loupe.height);
+
+    // Sample 15x15 pixels around cursor
+    const sampleSize = 15;
+    const half = Math.floor(sampleSize / 2);
+    const cellSize = loupe.width / sampleSize; // approx 9.3px per cell
+
+    // Draw zoomed pixels
+    ctx.drawImage(
+      img,
+      pxX - half,
+      pxY - half,
+      sampleSize,
+      sampleSize,
+      0,
+      0,
+      loupe.width,
+      loupe.height
+    );
+
+    // Draw grid lines
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= sampleSize; i++) {
+      ctx.beginPath();
+      ctx.moveTo(i * cellSize, 0);
+      ctx.lineTo(i * cellSize, loupe.height);
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.moveTo(0, i * cellSize);
+      ctx.lineTo(loupe.width, i * cellSize);
+      ctx.stroke();
+    }
+
+    // Crosshair target in center
+    const centerStart = half * cellSize;
+    ctx.strokeStyle = '#1882fc';
+    ctx.lineWidth = 1.5;
+
+    // Horizontal blue line (skipping center cell)
+    ctx.beginPath();
+    ctx.moveTo(0, centerStart + cellSize / 2);
+    ctx.lineTo(centerStart, centerStart + cellSize / 2);
+    ctx.moveTo(centerStart + cellSize, centerStart + cellSize / 2);
+    ctx.lineTo(loupe.width, centerStart + cellSize / 2);
+    ctx.stroke();
+
+    // Vertical blue line (skipping center cell)
+    ctx.beginPath();
+    ctx.moveTo(centerStart + cellSize / 2, 0);
+    ctx.lineTo(centerStart + cellSize / 2, centerStart);
+    ctx.moveTo(centerStart + cellSize / 2, centerStart + cellSize);
+    ctx.lineTo(centerStart + cellSize / 2, loupe.height);
+    ctx.stroke();
+
+    // White outline for the center sampled pixel
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(centerStart, centerStart, cellSize, cellSize);
+  }, [crop, hoverPoint]);
+
+  // Global keybindings
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.target as HTMLElement).matches('input,textarea')) return;
+
+      if (e.key === 'Escape') {
+        if (activeTool) {
+          setActiveTool(null);
+          return;
+        }
+        void call('cancel_capture');
+      }
+
+      // Enter to finish and copy
+      if (e.key === 'Enter' && crop) {
+        e.preventDefault();
+        void handleOutput('copy');
+      }
+
+      // 'C' key in stage 1 to copy hover color
+      if (!crop && (e.key === 'c' || e.key === 'C') && !e.ctrlKey && !e.metaKey) {
+        if (hoverPixelInfo) {
+          const colorText = colorFormat === 'hex' ? hoverPixelInfo.hex : hoverPixelInfo.rgb;
+          void call('write_text', { text: colorText });
+          showToast(`已复制颜色 ${colorText}`);
+        }
+      }
+
+      // 'S' key in stage 1 to toggle RGB/HEX format
+      if (!crop && (e.key === 's' || e.key === 'S') && !e.ctrlKey && !e.metaKey) {
+        setColorFormat(prev => (prev === 'hex' ? 'rgb' : 'hex'));
+      }
+
+      // Undo / Redo
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+        e.preventDefault();
+        if (e.shiftKey) redoShape();
+        else undoShape();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [crop, hoverPixelInfo, colorFormat, activeTool]);
+
+  const undoShape = () => {
+    setShapes(prev => {
+      if (!prev.length) return prev;
+      setRedo(r => [...r, prev[prev.length - 1]]);
+      return prev.slice(0, -1);
+    });
+  };
+
+  const redoShape = () => {
+    setRedo(prev => {
+      if (!prev.length) return prev;
+      setShapes(s => [...s, prev[prev.length - 1]]);
+      return prev.slice(0, -1);
+    });
+  };
+
+  const addShape = (shape: Shape) => {
+    setShapes(prev => [...prev, shape].slice(-100));
+    setRedo([]);
+  };
+
+  // Convert client coordinates to screen physical pixels
+  const getScreenPoint = (e: React.PointerEvent | MouseEvent): Point => {
+    if (!capture) return { x: e.clientX, y: e.clientY };
+    const rect = document.documentElement.getBoundingClientRect();
+    const scaleX = capture.width / (rect.width || window.innerWidth);
+    const scaleY = capture.height / (rect.height || window.innerHeight);
+    return {
+      x: Math.max(0, Math.min(capture.width, e.clientX * scaleX)),
+      y: Math.max(0, Math.min(capture.height, e.clientY * scaleY)),
+    };
+  };
+
+  // Stage 1: Pointer events (Drawing initial crop area)
+  const handleStage1PointerDown = (e: React.PointerEvent) => {
+    if (e.button !== 0) return;
+    const p = getScreenPoint(e);
+    setDragOrigin(p);
+    setDragCurrent(p);
+  };
+
+  const handleStage1PointerMove = (e: React.PointerEvent) => {
+    const p = getScreenPoint(e);
+    setHoverPoint(p);
+    if (dragOrigin) {
+      setDragCurrent(p);
+    }
+  };
+
+  const handleStage1PointerUp = (e: React.PointerEvent) => {
+    if (!dragOrigin || !capture) return;
+    const p = getScreenPoint(e);
+    const r = normalizedRect(dragOrigin, p, capture.width, capture.height);
+    setDragOrigin(null);
+    setDragCurrent(null);
+    if (r.width >= 6 && r.height >= 6) {
+      setCrop({
+        x: Math.round(r.x),
+        y: Math.round(r.y),
+        width: Math.round(r.width),
+        height: Math.round(r.height),
+      });
+    }
+  };
+
+  // Stage 2: 8-point resize handle dragging & moving
+  const handleResizeStart = (handle: string, e: React.PointerEvent) => {
+    e.stopPropagation();
+    if (!crop) return;
+    setResizingHandle(handle);
+    setResizeStart({ mouse: getScreenPoint(e), crop: { ...crop } });
+  };
+
+  const handleStage2PointerMove = (e: React.PointerEvent) => {
+    const current = getScreenPoint(e);
+    setHoverPoint(current);
+
+    if (resizingHandle && resizeStart && capture) {
+      const dx = current.x - resizeStart.mouse.x;
+      const dy = current.y - resizeStart.mouse.y;
+      const initial = resizeStart.crop;
+      let { x, y, width, height } = initial;
+
+      if (resizingHandle === 'move') {
+        x = Math.max(0, Math.min(capture.width - width, initial.x + dx));
+        y = Math.max(0, Math.min(capture.height - height, initial.y + dy));
+      } else {
+        if (resizingHandle.includes('w')) {
+          const newX = Math.max(0, Math.min(initial.x + initial.width - 20, initial.x + dx));
+          width = initial.width + (initial.x - newX);
+          x = newX;
+        }
+        if (resizingHandle.includes('e')) {
+          width = Math.max(20, Math.min(capture.width - initial.x, initial.width + dx));
+        }
+        if (resizingHandle.includes('n')) {
+          const newY = Math.max(0, Math.min(initial.y + initial.height - 20, initial.y + dy));
+          height = initial.height + (initial.y - newY);
+          y = newY;
+        }
+        if (resizingHandle.includes('s')) {
+          height = Math.max(20, Math.min(capture.height - initial.y, initial.height + dy));
+        }
+      }
+
+      setCrop({
+        x: Math.round(x),
+        y: Math.round(y),
+        width: Math.round(width),
+        height: Math.round(height),
+      });
+    }
+  };
+
+  const handleStage2PointerUp = () => {
+    setResizingHandle(null);
+    setResizeStart(null);
+  };
+
+  // Output action triggers
+  const handleOutput = async (action: string) => {
+    if (!canvasRef.current || busy) return;
     setBusy(true);
     try {
-      // Load all images and stitch
-      const loaded: HTMLImageElement[] = await Promise.all(
-        all.map(
-          src =>
-            new Promise<HTMLImageElement>((resolve, reject) => {
-              const im = new Image();
-              im.onload = () => resolve(im);
-              im.onerror = reject;
-              im.src = src;
-            })
-        )
-      );
-      const maxW = Math.max(...loaded.map(im => im.width));
-      const totalH = loaded.reduce((sum, im) => sum + im.height, 0);
-      const stitchCanvas = document.createElement('canvas');
-      stitchCanvas.width = maxW;
-      stitchCanvas.height = totalH;
-      const sCtx = stitchCanvas.getContext('2d')!;
-      let curY = 0;
-      for (const im of loaded) {
-        sCtx.drawImage(im, 0, curY);
-        curY += im.height;
-      }
-      const finalData = stitchCanvas.toDataURL('image/png');
-      await call('capture_output', { data: finalData, action: 'copy' });
+      const dataUrl = canvasRef.current.toDataURL('image/png');
+      await call('capture_output', { data: dataUrl, action });
     } catch (e) {
-      setError((e as Error).message);
+      showToast((e as Error).message || '操作失败');
     } finally {
       setBusy(false);
     }
-  }
+  };
 
-  // Pin window mode
+  // Perform translation directly on crop
+  const handleTranslate = async () => {
+    if (!canvasRef.current || busy) return;
+    setBusy(true);
+    try {
+      const dataUrl = canvasRef.current.toDataURL('image/png');
+      // Trigger OCR recognition first, then forward text to quick-translate
+      await call('capture_output', { data: dataUrl, action: 'ocr' });
+      // Close capture window and open quick translate
+      void call('cancel_capture');
+    } catch (e) {
+      showToast((e as Error).message || '文字识别失败');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // Pin window mode (existing floating pinned reference)
   if (mode === 'pin') {
     return (
       <div className="pin-window" style={{ opacity }} onDoubleClick={() => void call('edit_pin')}>
@@ -346,7 +473,6 @@ export default function CaptureEditor({ mode }: { mode: string }) {
           </button>
         </div>
         {capture && <img src={capture.data} alt="置顶参考图片" style={{ width: `${zoom * 100}%` }} />}
-        {error && <p className="error-text">{error}</p>}
       </div>
     );
   }
@@ -354,275 +480,235 @@ export default function CaptureEditor({ mode }: { mode: string }) {
   if (!capture) {
     return (
       <div className="capture-loading">
-        {error || '正在准备屏幕采集…'}
-        <button onClick={() => void call('cancel_capture')}>取消</button>
+        <span>正在准备屏幕捕获…</span>
       </div>
     );
   }
 
-  // Selection stage (crop is not finalized yet)
+  // Magnifier Loupe position calculation (prevent overflowing screen)
+  const loupePosition = useMemo(() => {
+    if (!hoverPoint || !capture) return { left: 0, top: 0, show: false };
+    const winW = window.innerWidth;
+    const winH = window.innerHeight;
+    const clientX = (hoverPoint.x / capture.width) * winW;
+    const clientY = (hoverPoint.y / capture.height) * winH;
+
+    const loupeW = 145;
+    const loupeH = 220;
+    const offset = 18;
+
+    let left = clientX + offset;
+    let top = clientY + offset;
+
+    // Flip to left if near right edge
+    if (left + loupeW > winW - 10) {
+      left = clientX - loupeW - offset;
+    }
+    // Flip to top if near bottom edge
+    if (top + loupeH > winH - 10) {
+      top = clientY - loupeH - offset;
+    }
+
+    return {
+      left: Math.max(8, left),
+      top: Math.max(8, top),
+      crosshairX: clientX,
+      crosshairY: clientY,
+      show: true,
+    };
+  }, [hoverPoint, capture]);
+
+  // Stage 1: Initial Selection & Figure 1 Magnifier Loupe
   if (!crop) {
+    const draggingRect =
+      dragOrigin && dragCurrent
+        ? normalizedRect(dragOrigin, dragCurrent, capture.width, capture.height)
+        : null;
+
     return (
       <div
-        className="screen-selection"
-        ref={selection}
+        className="screen-capture-viewport"
         onContextMenu={e => {
           e.preventDefault();
           void call('cancel_capture');
         }}
-        onPointerDown={e => {
-          if (e.button !== 0) return;
-          e.currentTarget.setPointerCapture(e.pointerId);
-          const p = point(e, e.currentTarget, capture.width, capture.height);
-          if (mode === 'color') {
-            if (hoverColor) {
-              void call('capture_color', { color: hoverColor.hex });
-            }
-            return;
-          }
-          setOrigin(p);
-          setEnd(p);
-        }}
-        onPointerMove={e => {
-          const p = point(e, e.currentTarget, capture.width, capture.height);
-          setHoverPoint(p);
-          if (origin) setEnd(p);
-        }}
-        onPointerUp={e => {
-          if (!origin) return;
-          const r = normalizedRect(
-            origin,
-            point(e, e.currentTarget, capture.width, capture.height),
-            capture.width,
-            capture.height
-          );
-          if (r.width >= 4 && r.height >= 4) {
-            setCrop({
-              x: Math.round(r.x),
-              y: Math.round(r.y),
-              width: Math.round(r.width),
-              height: Math.round(r.height),
-            });
-          }
-          setOrigin(null);
-          setEnd(null);
-        }}
+        onPointerDown={handleStage1PointerDown}
+        onPointerMove={handleStage1PointerMove}
+        onPointerUp={handleStage1PointerUp}
       >
+        {/* Fullscreen clean background image */}
         <img
           src={capture.data}
           alt="screen"
-          className="selection-background-img"
+          className="fullscreen-raw-img"
           draggable={false}
         />
-        <div className="selection-instructions">
-          {mode === 'color' ? '移动光标实时取色 · 点击复制 HEX' : '拖动选择截图区域 · 双击全选'}
-          <span>Esc 或右键取消</span>
-        </div>
 
-        {/* Magnifying Loupe for Color Picker */}
-        {mode === 'color' && hoverColor && hoverPoint && (
-          <div
-            className="color-loupe"
-            style={{
-              left: `${Math.min(capture.width - 150, Math.max(20, hoverPoint.x + 25))}px`,
-              top: `${Math.min(capture.height - 150, Math.max(20, hoverPoint.y + 25))}px`,
-            }}
-          >
-            <div className="loupe-preview" style={{ background: hoverColor.hex }} />
-            <div className="loupe-meta">
-              <strong>{hoverColor.hex}</strong>
-              <span>RGB({hoverColor.r}, {hoverColor.g}, {hoverColor.b})</span>
-              <small>十进制: {hoverColor.intVal}</small>
-              <small>坐标: {hoverColor.pxX}, {hoverColor.pxY}</small>
-            </div>
-          </div>
-        )}
-
-        {/* Selection Rectangle */}
-        {origin && end && (() => {
-          const r = normalizedRect(origin, end, capture.width, capture.height);
-          return (
+        {/* Dark overlay with cut-out hole during dragging */}
+        <div className="screen-mask-overlay">
+          {draggingRect && (
             <div
-              className="selection-rect"
+              className="selection-box-cutout"
               style={{
-                left: `${(r.x / capture.width) * 100}%`,
-                top: `${(r.y / capture.height) * 100}%`,
-                width: `${(r.width / capture.width) * 100}%`,
-                height: `${(r.height / capture.height) * 100}%`,
+                left: `${(draggingRect.x / capture.width) * 100}%`,
+                top: `${(draggingRect.y / capture.height) * 100}%`,
+                width: `${(draggingRect.width / capture.width) * 100}%`,
+                height: `${(draggingRect.height / capture.height) * 100}%`,
               }}
             >
-              <span>
-                {Math.round(r.width)} × {Math.round(r.height)} px
+              <span className="dimension-badge">
+                {Math.round(draggingRect.width)} × {Math.round(draggingRect.height)}
               </span>
             </div>
-          );
-        })()}
+          )}
+        </div>
+
+        {/* Figure 1: Crosshair & Magnifier Loupe with Color Picker */}
+        {loupePosition.show && !draggingRect && hoverPixelInfo && (
+          <>
+            {/* Precision Crosshair indicator on mouse */}
+            <div
+              className="precision-crosshair"
+              style={{
+                left: `${loupePosition.crosshairX}px`,
+                top: `${loupePosition.crosshairY}px`,
+              }}
+            >
+              <div className="crosshair-h" />
+              <div className="crosshair-v" />
+            </div>
+
+            {/* Magnifier Window & Info Box (Exact match with Fig 1) */}
+            <div
+              className="pixel-loupe-card"
+              style={{
+                left: `${loupePosition.left}px`,
+                top: `${loupePosition.top}px`,
+              }}
+            >
+              {/* Top: 15x15 Pixel Grid View */}
+              <canvas
+                ref={loupeCanvasRef}
+                width={140}
+                height={140}
+                className="loupe-canvas"
+              />
+
+              {/* Bottom: Coordinates, Color Block, Key Prompts */}
+              <div className="loupe-info-panel">
+                <div className="coord-row">
+                  ({hoverPixelInfo.pxX}, {hoverPixelInfo.pxY})
+                </div>
+
+                <div className="color-row">
+                  <span
+                    className="color-swatch"
+                    style={{ backgroundColor: hoverPixelInfo.hex }}
+                  />
+                  <strong className="color-code">
+                    {colorFormat === 'hex' ? hoverPixelInfo.hex : hoverPixelInfo.rgb}
+                  </strong>
+                </div>
+
+                <div className="prompt-row">按 C 复制颜色</div>
+                <div className="prompt-row">按 S 切换RGB/HEX</div>
+              </div>
+            </div>
+          </>
+        )}
+
+        {toast && <div className="screen-toast">{toast}</div>}
       </div>
     );
   }
 
-  // Annotation & Action Toolbar Stage
+  // Stage 2: Figure 2 Selection Box with 8-Point Resize Handles & White Floating Toolbar
+  const winW = window.innerWidth;
+  const winH = window.innerHeight;
+  const cropLeft = (crop.x / capture.width) * winW;
+  const cropTop = (crop.y / capture.height) * winH;
+  const cropW = (crop.width / capture.width) * winW;
+  const cropH = (crop.height / capture.height) * winH;
+
+  // Floating Toolbar Position (Attached to bottom-right of selection, flips if overflowing)
+  const isToolbarBottom = cropTop + cropH + 52 <= winH;
+  const toolbarTop = isToolbarBottom ? cropTop + cropH + 8 : Math.max(8, cropTop - 48);
+  const toolbarRight = Math.max(12, winW - (cropLeft + cropW));
+
   return (
-    <div className="capture-editor">
-      <header>
-        <span>
-          <ScanLine size={18} />
-          <strong>dudu 截图</strong>
-          <small>
-            {crop.width} × {crop.height} px
-          </small>
-        </span>
-        <div>
-          <button
-            className={showToolbar ? 'selected' : ''}
-            onClick={() => setShowToolbar(v => !v)}
-            title="折叠/展开标注工具"
-          >
-            <Layers size={16} />
-            标注
-          </button>
-          <button disabled={busy} onClick={() => void output('ocr')} title="文字识别">
-            <ScanLine size={16} />
-            识别文字
-          </button>
-          <button disabled={busy} onClick={() => void output('pin')} title="贴图置顶">
-            <Pin size={16} />
-            贴图
-          </button>
-          <button disabled={busy} onClick={() => void output('markdown')} title="复制 Markdown 语法">
-            <Code size={16} />
-            Markdown
-          </button>
-          <button disabled={busy} onClick={() => void output('base64')} title="复制 Base64">
-            Base64
-          </button>
-          <button disabled={busy} onClick={() => void output('save')} title="保存文件 (PNG/JPG/WebP)">
-            <Download size={16} />
-            保存
-          </button>
-          <button className="primary" disabled={busy} onClick={() => void output('copy')}>
-            <Copy size={16} />
-            复制图片
-          </button>
-          <button onClick={() => void call('cancel_capture')} aria-label="取消截图">
-            <X size={18} />
-          </button>
-        </div>
-      </header>
+    <div
+      className="screen-capture-viewport stage-2"
+      onPointerMove={handleStage2PointerMove}
+      onPointerUp={handleStage2PointerUp}
+      onContextMenu={e => {
+        e.preventDefault();
+        void call('cancel_capture');
+      }}
+    >
+      {/* Background Image */}
+      <img
+        src={capture.data}
+        alt="screen"
+        className="fullscreen-raw-img"
+        draggable={false}
+      />
 
-      {/* Annotation Tools */}
-      {showToolbar && (
-        <div className="editor-toolbar">
-          {[
-            ['arrow', ArrowUpRight, '箭头 (A)'],
-            ['line', Slash, '直线 (L)'],
-            ['rect', Square, '矩形 (R)'],
-            ['ellipse', Circle, '椭圆 (E)'],
-            ['pen', Pen, '画笔 (P)'],
-            ['text', Type, '文字 (T)'],
-            ['highlight', Highlighter, '高亮色块 (H)'],
-            ['mosaic', Grid2X2, '马赛克 (M)'],
-            ['number', Hash, '步骤序号 (N)'],
-          ].map(([id, Icon, label]) => {
-            const I = Icon as typeof Square;
-            return (
-              <button
-                key={String(id)}
-                aria-label={String(label)}
-                title={String(label)}
-                className={tool === id ? 'selected' : ''}
-                onClick={() => setTool(String(id))}
-              >
-                <I size={18} />
-              </button>
-            );
-          })}
-          <i />
-          <input
-            aria-label="标注颜色"
-            title="选择颜色"
-            type="color"
-            value={color}
-            onChange={e => setColor(e.target.value)}
-          />
-          <input
-            aria-label="画笔粗细"
-            title={`笔触粗细: ${width}px`}
-            type="range"
-            min="2"
-            max="24"
-            value={width}
-            onChange={e => setWidth(+e.target.value)}
-          />
-          <i />
-          <button aria-label="撤销" title="撤销 (Ctrl+Z)" disabled={!shapes.length} onClick={undo}>
-            <Undo2 size={18} />
-          </button>
-          <button aria-label="重做" title="重做 (Ctrl+Shift+Z)" disabled={!redo.length} onClick={redoOne}>
-            <Redo2 size={18} />
-          </button>
-          <i />
-          <button
-            title="拼接长截图：将当前切片存入长图队列"
-            onClick={() => void output('stitch_add')}
-          >
-            + 拼入长图
-          </button>
-          {stitchImages.length > 0 && (
-            <button className="primary" onClick={() => void completeStitch()} title="完成拼接并复制">
-              <Check size={15} /> 完成长图 ({stitchImages.length + 1} 屏)
-            </button>
-          )}
-        </div>
-      )}
+      {/* Dark Mask with Selection Cutout (Fig 2) */}
+      <div
+        className="screen-mask-overlay selection-active"
+        style={{
+          clipPath: `polygon(
+            0% 0%, 100% 0%, 100% 100%, 0% 100%, 0% 0%,
+            ${cropLeft}px ${cropTop}px,
+            ${cropLeft}px ${cropTop + cropH}px,
+            ${cropLeft + cropW}px ${cropTop + cropH}px,
+            ${cropLeft + cropW}px ${cropTop}px,
+            ${cropLeft}px ${cropTop}px
+          )`,
+        }}
+      />
 
-      {error && <div role="alert" className="error-banner">{error}</div>}
-      {copiedHint && <div className="toast" role="status"><Check size={16} />{copiedHint}</div>}
-
-      {/* Detected QR code card */}
-      {detectedQr && (
-        <div className="qr-detected-banner">
-          <QrCode size={18} />
-          <span>
-            识别到二维码内容: <strong>{detectedQr}</strong>
-          </span>
-          <div>
-            <button
-              onClick={() => {
-                void call('write_text', { text: detectedQr });
-                setCopiedHint('二维码内容已复制');
-                setTimeout(() => setCopiedHint(''), 2000);
-              }}
-            >
-              <Copy size={13} /> 复制
-            </button>
-            {/^https?:\/\//i.test(detectedQr) && (
-              <button onClick={() => void call('open_external', { url: detectedQr })}>
-                <ExternalLink size={13} /> 打开链接
-              </button>
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* Canvas Area */}
-      <div className="canvas-stage">
+      {/* The Active Selection Box (Fig 2 dashed border + 8 resize points) */}
+      <div
+        className="selection-active-box"
+        style={{
+          left: `${cropLeft}px`,
+          top: `${cropTop}px`,
+          width: `${cropW}px`,
+          height: `${cropH}px`,
+          cursor: activeTool ? 'crosshair' : 'move',
+        }}
+        onPointerDown={e => {
+          if (!activeTool && e.button === 0) {
+            handleResizeStart('move', e);
+          }
+        }}
+        onDoubleClick={() => void handleOutput('copy')}
+      >
+        {/* Annotation Canvas inside selection */}
         <canvas
-          ref={canvas}
+          ref={canvasRef}
           width={crop.width}
           height={crop.height}
+          className="annotation-canvas"
           onPointerDown={e => {
-            if (e.button !== 0) return;
-            e.currentTarget.setPointerCapture(e.pointerId);
-            const p = point(e, e.currentTarget, crop.width, crop.height);
-            if (tool === 'text') {
+            if (!activeTool || e.button !== 0) return;
+            e.stopPropagation();
+            const r = canvasRef.current?.getBoundingClientRect();
+            if (!r) return;
+            const p: Point = {
+              x: ((e.clientX - r.left) * crop.width) / r.width,
+              y: ((e.clientY - r.top) * crop.height) / r.height,
+            };
+
+            if (activeTool === 'text') {
               setTextAt(p);
-              setText('');
+              setTextInput('');
               return;
             }
-            if (tool === 'number') {
-              add({
-                tool,
+            if (activeTool === 'number') {
+              addShape({
+                tool: 'number',
                 points: [p],
                 color,
                 width,
@@ -630,34 +716,256 @@ export default function CaptureEditor({ mode }: { mode: string }) {
               });
               return;
             }
-            setDrawing({ tool, points: [p, p], color, width });
+            setDrawing({ tool: activeTool, points: [p, p], color, width });
           }}
           onPointerMove={e => {
             if (!drawing) return;
-            const p = point(e, e.currentTarget, crop.width, crop.height);
+            const r = canvasRef.current?.getBoundingClientRect();
+            if (!r) return;
+            const p: Point = {
+              x: ((e.clientX - r.left) * crop.width) / r.width,
+              y: ((e.clientY - r.top) * crop.height) / r.height,
+            };
             setDrawing({
               ...drawing,
-              points: tool === 'pen' ? [...drawing.points, p] : [drawing.points[0], p],
+              points: drawing.tool === 'pen' ? [...drawing.points, p] : [drawing.points[0], p],
             });
           }}
           onPointerUp={() => {
             if (drawing) {
-              add(drawing);
+              addShape(drawing);
               setDrawing(null);
             }
           }}
         />
+
+        {/* 8-Point Resize Handles (Circles from Fig 2) */}
+        {!activeTool && (
+          <>
+            <div
+              className="resize-handle handle-nw"
+              onPointerDown={e => handleResizeStart('nw', e)}
+            />
+            <div
+              className="resize-handle handle-n"
+              onPointerDown={e => handleResizeStart('n', e)}
+            />
+            <div
+              className="resize-handle handle-ne"
+              onPointerDown={e => handleResizeStart('ne', e)}
+            />
+            <div
+              className="resize-handle handle-e"
+              onPointerDown={e => handleResizeStart('e', e)}
+            />
+            <div
+              className="resize-handle handle-se"
+              onPointerDown={e => handleResizeStart('se', e)}
+            />
+            <div
+              className="resize-handle handle-s"
+              onPointerDown={e => handleResizeStart('s', e)}
+            />
+            <div
+              className="resize-handle handle-sw"
+              onPointerDown={e => handleResizeStart('sw', e)}
+            />
+            <div
+              className="resize-handle handle-w"
+              onPointerDown={e => handleResizeStart('w', e)}
+            />
+          </>
+        )}
+
+        {/* Dimension badge at top-left of selection */}
+        <div className="dimension-badge top-outside">
+          {crop.width} × {crop.height}
+        </div>
       </div>
 
-      {mode === 'ocr' && (
-        <div className="ocr-prompt">
-          <span>选区已确定，点击「识别文字」开始离线 OCR，或直接进入截图翻译。</span>
-          <button className="primary" disabled={busy} onClick={() => void output('ocr')}>
-            <ScanLine size={15} /> 识别文字
-          </button>
+      {/* Secondary Color & Size Palette Bar when tool is selected */}
+      {activeTool && (
+        <div
+          className="sub-toolbar-palette"
+          style={{
+            top: `${Math.max(8, toolbarTop - 42)}px`,
+            right: `${toolbarRight}px`,
+          }}
+        >
+          <div className="palette-colors">
+            {PRESET_COLORS.map(c => (
+              <button
+                key={c}
+                className={`color-dot ${color === c ? 'active' : ''}`}
+                style={{ backgroundColor: c }}
+                onClick={() => setColor(c)}
+              />
+            ))}
+          </div>
+          <div className="palette-divider" />
+          <div className="palette-widths">
+            {PRESET_WIDTHS.map(w => (
+              <button
+                key={w}
+                className={`width-pill ${width === w ? 'active' : ''}`}
+                onClick={() => setWidth(w)}
+              >
+                <span style={{ height: `${w}px` }} />
+              </button>
+            ))}
+          </div>
         </div>
       )}
 
+      {/* Figure 2: White Floating Pill Toolbar Attached to Selection */}
+      <div
+        className="floating-toolbar-pill"
+        style={{
+          top: `${toolbarTop}px`,
+          right: `${toolbarRight}px`,
+        }}
+      >
+        {/* Brand / Decorative Icon */}
+        <div className="toolbar-brand-dot" title="dudu 截图">
+          <Sparkles size={16} />
+        </div>
+
+        {/* 1. Rect */}
+        <button
+          className={`tb-btn ${activeTool === 'rect' ? 'active' : ''}`}
+          onClick={() => setActiveTool(activeTool === 'rect' ? null : 'rect')}
+          title="矩形标注"
+        >
+          <Square size={16} />
+        </button>
+
+        {/* 2. Circle */}
+        <button
+          className={`tb-btn ${activeTool === 'ellipse' ? 'active' : ''}`}
+          onClick={() => setActiveTool(activeTool === 'ellipse' ? null : 'ellipse')}
+          title="圆形标注"
+        >
+          <Circle size={16} />
+        </button>
+
+        {/* 3. Arrow */}
+        <button
+          className={`tb-btn ${activeTool === 'arrow' ? 'active' : ''}`}
+          onClick={() => setActiveTool(activeTool === 'arrow' ? null : 'arrow')}
+          title="箭头标注"
+        >
+          <ArrowUpRight size={17} />
+        </button>
+
+        {/* 4. Pen */}
+        <button
+          className={`tb-btn ${activeTool === 'pen' ? 'active' : ''}`}
+          onClick={() => setActiveTool(activeTool === 'pen' ? null : 'pen')}
+          title="自由画笔"
+        >
+          <Pen size={15} />
+        </button>
+
+        {/* 5. Mosaic */}
+        <button
+          className={`tb-btn ${activeTool === 'mosaic' ? 'active' : ''}`}
+          onClick={() => setActiveTool(activeTool === 'mosaic' ? null : 'mosaic')}
+          title="马赛克"
+        >
+          <Grid2X2 size={16} />
+        </button>
+
+        {/* 6. Text */}
+        <button
+          className={`tb-btn ${activeTool === 'text' ? 'active' : ''}`}
+          onClick={() => setActiveTool(activeTool === 'text' ? null : 'text')}
+          title="添加文字"
+        >
+          <Type size={16} />
+        </button>
+
+        {/* 7. Number step */}
+        <button
+          className={`tb-btn ${activeTool === 'number' ? 'active' : ''}`}
+          onClick={() => setActiveTool(activeTool === 'number' ? null : 'number')}
+          title="序号标记"
+        >
+          <Hash size={16} />
+        </button>
+
+        {/* 8. Undo */}
+        <button
+          className="tb-btn"
+          disabled={!shapes.length}
+          onClick={undoShape}
+          title="撤销 (Ctrl+Z)"
+        >
+          <Undo2 size={16} />
+        </button>
+
+        <div className="tb-divider" />
+
+        {/* 9. OCR */}
+        <button
+          className="tb-btn"
+          disabled={busy}
+          onClick={() => void handleOutput('ocr')}
+          title="文字识别"
+        >
+          <ScanLine size={16} />
+        </button>
+
+        {/* 10. Translate */}
+        <button
+          className="tb-btn"
+          disabled={busy}
+          onClick={() => void handleTranslate()}
+          title="翻译区域文字"
+        >
+          <Languages size={16} />
+        </button>
+
+        {/* 11. Pin */}
+        <button
+          className="tb-btn"
+          disabled={busy}
+          onClick={() => void handleOutput('pin')}
+          title="置顶贴图"
+        >
+          <Pin size={16} />
+        </button>
+
+        {/* 12. Save */}
+        <button
+          className="tb-btn"
+          disabled={busy}
+          onClick={() => void handleOutput('save')}
+          title="保存为文件"
+        >
+          <Download size={16} />
+        </button>
+
+        {/* 13. Cancel */}
+        <button
+          className="tb-btn cancel-btn"
+          onClick={() => void call('cancel_capture')}
+          title="取消截图 (Esc)"
+        >
+          <X size={17} />
+        </button>
+
+        {/* 14. Finish & Copy */}
+        <button
+          className="tb-btn confirm-btn"
+          disabled={busy}
+          onClick={() => void handleOutput('copy')}
+          title="完成截图并复制 (Enter / 双击)"
+        >
+          <Check size={18} />
+        </button>
+      </div>
+
+      {/* Modal for Text Annotation Input */}
       {textAt && (
         <div className="modal-backdrop">
           <section className="modal">
@@ -665,9 +973,9 @@ export default function CaptureEditor({ mode }: { mode: string }) {
             <textarea
               autoFocus
               className="edit-content"
-              placeholder="输入标注文字，支持回车换行…"
-              value={text}
-              onChange={e => setText(e.target.value)}
+              placeholder="输入标注文字…"
+              value={textInput}
+              onChange={e => setTextInput(e.target.value)}
             />
             <div className="modal-actions">
               <button className="secondary" onClick={() => setTextAt(null)}>
@@ -676,26 +984,36 @@ export default function CaptureEditor({ mode }: { mode: string }) {
               <button
                 className="primary"
                 onClick={() => {
-                  if (text.trim()) {
-                    add({ tool: 'text', points: [textAt], text, color, width });
+                  if (textInput.trim()) {
+                    addShape({
+                      tool: 'text',
+                      points: [textAt],
+                      text: textInput,
+                      color,
+                      width,
+                    });
                   }
                   setTextAt(null);
                 }}
               >
-                确定添加
+                确定
               </button>
             </div>
           </section>
         </div>
       )}
+
+      {toast && <div className="screen-toast">{toast}</div>}
     </div>
   );
 }
 
-function draw(ctx: CanvasRenderingContext2D, s: Shape) {
+// Draw Shapes Function
+function drawShape(ctx: CanvasRenderingContext2D, s: Shape) {
   const a = s.points[0];
   const b = s.points[s.points.length - 1];
   const r = normalizedRect(a, b, ctx.canvas.width, ctx.canvas.height);
+
   ctx.save();
   ctx.strokeStyle = s.color;
   ctx.fillStyle = s.color;
@@ -705,65 +1023,55 @@ function draw(ctx: CanvasRenderingContext2D, s: Shape) {
 
   if (s.tool === 'rect') {
     ctx.strokeRect(r.x, r.y, r.width, r.height);
-  }
-  if (s.tool === 'ellipse') {
+  } else if (s.tool === 'ellipse') {
     ctx.beginPath();
     ctx.ellipse(
       r.x + r.width / 2,
       r.y + r.height / 2,
-      r.width / 2,
-      r.height / 2,
+      Math.max(1, r.width / 2),
+      Math.max(1, r.height / 2),
       0,
       0,
       2 * Math.PI
     );
     ctx.stroke();
-  }
-  if (s.tool === 'line') {
+  } else if (s.tool === 'arrow') {
     ctx.beginPath();
     ctx.moveTo(a.x, a.y);
     ctx.lineTo(b.x, b.y);
     ctx.stroke();
-  }
-  if (s.tool === 'arrow' || s.tool === 'pen') {
+
+    const angle = Math.atan2(b.y - a.y, b.x - a.x);
+    const headLen = Math.max(14, s.width * 3.5);
+    ctx.beginPath();
+    ctx.moveTo(b.x, b.y);
+    ctx.lineTo(b.x - headLen * Math.cos(angle - Math.PI / 7), b.y - headLen * Math.sin(angle - Math.PI / 7));
+    ctx.moveTo(b.x, b.y);
+    ctx.lineTo(b.x - headLen * Math.cos(angle + Math.PI / 7), b.y - headLen * Math.sin(angle + Math.PI / 7));
+    ctx.stroke();
+  } else if (s.tool === 'pen') {
     ctx.beginPath();
     ctx.moveTo(a.x, a.y);
     for (const p of s.points.slice(1)) {
       ctx.lineTo(p.x, p.y);
     }
     ctx.stroke();
-    if (s.tool === 'arrow') {
-      const angle = Math.atan2(b.y - a.y, b.x - a.x);
-      const size = Math.max(12, s.width * 4);
-      ctx.beginPath();
-      ctx.moveTo(b.x - size * Math.cos(angle - 0.45), b.y - size * Math.sin(angle - 0.45));
-      ctx.lineTo(b.x, b.y);
-      ctx.lineTo(b.x - size * Math.cos(angle + 0.45), b.y - size * Math.sin(angle + 0.45));
-      ctx.stroke();
-    }
-  }
-  if (s.tool === 'highlight') {
-    ctx.globalAlpha = 0.35;
-    ctx.fillRect(r.x, r.y, r.width, r.height);
-  }
-  if (s.tool === 'text') {
-    ctx.font = `600 ${Math.max(18, s.width * 5)}px sans-serif`;
+  } else if (s.tool === 'text') {
+    ctx.font = `600 ${Math.max(16, s.width * 5)}px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
     s.text?.split('\n').forEach((line, i) => {
-      ctx.fillText(line, a.x, a.y + i * Math.max(24, s.width * 6));
+      ctx.fillText(line, a.x, a.y + i * Math.max(22, s.width * 6));
     });
-  }
-  if (s.tool === 'number') {
-    const rad = Math.max(14, s.width * 4);
+  } else if (s.tool === 'number') {
+    const rad = Math.max(13, s.width * 3.5);
     ctx.beginPath();
     ctx.arc(a.x, a.y, rad, 0, Math.PI * 2);
     ctx.fill();
-    ctx.fillStyle = 'white';
+    ctx.fillStyle = '#ffffff';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.font = `700 ${Math.max(15, s.width * 3.8)}px sans-serif`;
+    ctx.font = `700 ${Math.max(13, s.width * 3.2)}px sans-serif`;
     ctx.fillText(String(s.index), a.x, a.y);
-  }
-  if (s.tool === 'mosaic' && r.width > 0 && r.height > 0) {
+  } else if (s.tool === 'mosaic' && r.width > 0 && r.height > 0) {
     const block = Math.max(8, s.width * 3);
     for (let y = Math.floor(r.y); y < r.y + r.height; y += block) {
       for (let x = Math.floor(r.x); x < r.x + r.width; x += block) {

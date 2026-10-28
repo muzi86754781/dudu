@@ -27,6 +27,7 @@ struct AppState {
     db: Mutex<store::Store>,
     settings: Mutex<Settings>,
     capture: RwLock<Option<RgbaImage>>,
+    capture_cache: RwLock<Option<Capture>>,
     data_dir: PathBuf,
 }
 
@@ -746,15 +747,13 @@ fn capture_start_with_state<R: tauri::Runtime>(
     let height = image.height();
     *state.capture.write().map_err(err)? = Some(image.clone());
     let bytes = encode_png(&image)?;
-    app.emit(
-        "capture-ready",
-        Capture {
-            data: format!("data:image/png;base64,{}", BASE64.encode(bytes)),
-            width,
-            height,
-        },
-    )
-    .map_err(err)?;
+    let cap = Capture {
+        data: format!("data:image/png;base64,{}", BASE64.encode(bytes)),
+        width,
+        height,
+    };
+    *state.capture_cache.write().map_err(err)? = Some(cap.clone());
+    let _ = app.emit("capture-ready", cap);
     let url = WebviewUrl::App(format!("index.html?overlay={mode}").into());
     if let Some(existing) = app.get_webview_window("capture") {
         let _ = existing.close();
@@ -764,7 +763,6 @@ fn capture_start_with_state<R: tauri::Runtime>(
         .decorations(false)
         .always_on_top(true)
         .skip_taskbar(true)
-        .transparent(true)
         .fullscreen(true);
     let win = builder.build().map_err(err)?;
     let _ = win.set_focus();
@@ -792,6 +790,9 @@ fn decode_data(input: &str, limit: usize) -> Result<Vec<u8>> {
 
 #[tauri::command]
 fn pending_capture(state: tauri::State<'_, AppState>) -> Result<Capture> {
+    if let Some(cached) = state.capture_cache.read().map_err(err)?.clone() {
+        return Ok(cached);
+    }
     let image = state
         .capture
         .read()
@@ -800,11 +801,13 @@ fn pending_capture(state: tauri::State<'_, AppState>) -> Result<Capture> {
         .ok_or("没有待处理的截图")?;
     let width = image.width();
     let height = image.height();
-    Ok(Capture {
+    let cap = Capture {
         data: format!("data:image/png;base64,{}", BASE64.encode(encode_png(&image)?)),
         width,
         height,
-    })
+    };
+    *state.capture_cache.write().map_err(err)? = Some(cap.clone());
+    Ok(cap)
 }
 
 #[tauri::command]
@@ -1548,6 +1551,7 @@ pub fn run() {
                 db: Mutex::new(database),
                 settings: Mutex::new(settings.clone()),
                 capture: RwLock::new(None),
+                capture_cache: RwLock::new(None),
                 data_dir: base.clone(),
             });
             let icon_errors = register_shortcuts(app.handle(), &settings);

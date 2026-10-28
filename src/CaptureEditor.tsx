@@ -49,7 +49,38 @@ const PRESET_COLORS = [
 
 const PRESET_WIDTHS = [2, 4, 8];
 
+class CaptureErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean; error: string }> {
+  constructor(props: { children: React.ReactNode }) {
+    super(props);
+    this.state = { hasError: false, error: '' };
+  }
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error: error.message };
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{ position: 'fixed', inset: 0, background: '#1c2024', color: '#ffffff', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 16, zIndex: 99999 }}>
+          <p>截图界面遇到问题：{this.state.error}</p>
+          <button style={{ padding: '8px 18px', background: '#47765b', color: '#ffffff', border: 0, borderRadius: 6, cursor: 'pointer' }} onClick={() => void call('cancel_capture')}>
+            退出截图
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 export default function CaptureEditor({ mode }: { mode: string }) {
+  return (
+    <CaptureErrorBoundary>
+      <CaptureEditorInner mode={mode} />
+    </CaptureErrorBoundary>
+  );
+}
+
+function CaptureEditorInner({ mode }: { mode: string }) {
   const [capture, setCapture] = useState<Capture | null>(null);
   const [crop, setCrop] = useState<Rect | null>(null);
   const [activeTool, setActiveTool] = useState<string | null>(null);
@@ -107,27 +138,24 @@ export default function CaptureEditor({ mode }: { mode: string }) {
   const renderAnnotations = useCallback(() => {
     const canvas = canvasRef.current;
     const img = imageRef.current;
-    if (!canvas || !crop || !img) return;
+    if (!canvas || !crop || !img || crop.width <= 0 || crop.height <= 0) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    ctx.clearRect(0, 0, crop.width, crop.height);
-    // Draw cropped portion from original image
-    ctx.drawImage(
-      img,
-      crop.x,
-      crop.y,
-      crop.width,
-      crop.height,
-      0,
-      0,
-      crop.width,
-      crop.height
-    );
+    try {
+      ctx.clearRect(0, 0, crop.width, crop.height);
+      const sx = Math.max(0, Math.min(img.width - crop.width, crop.x));
+      const sy = Math.max(0, Math.min(img.height - crop.height, crop.y));
+      const sw = Math.min(crop.width, img.width - sx);
+      const sh = Math.min(crop.height, img.height - sy);
 
-    // Draw saved and in-progress shapes
-    for (const s of [...shapes, ...(drawing ? [drawing] : [])]) {
-      drawShape(ctx, s);
+      ctx.drawImage(img, sx, sy, sw, sh, 0, 0, crop.width, crop.height);
+
+      for (const s of [...shapes, ...(drawing ? [drawing] : [])]) {
+        drawShape(ctx, s);
+      }
+    } catch {
+      // Prevent render crashes
     }
   }, [crop, shapes, drawing]);
 
@@ -171,23 +199,30 @@ export default function CaptureEditor({ mode }: { mode: string }) {
     ctx.imageSmoothingEnabled = false;
     ctx.clearRect(0, 0, loupe.width, loupe.height);
 
-    // Sample 15x15 pixels around cursor
+    // Sample 15x15 pixels around cursor with safe boundary protection
     const sampleSize = 15;
     const half = Math.floor(sampleSize / 2);
     const cellSize = loupe.width / sampleSize; // approx 9.3px per cell
 
-    // Draw zoomed pixels
-    ctx.drawImage(
-      img,
-      pxX - half,
-      pxY - half,
-      sampleSize,
-      sampleSize,
-      0,
-      0,
-      loupe.width,
-      loupe.height
-    );
+    const sx = Math.max(0, Math.min(img.width - sampleSize, pxX - half));
+    const sy = Math.max(0, Math.min(img.height - sampleSize, pxY - half));
+
+    try {
+      // Draw zoomed pixels safely
+      ctx.drawImage(
+        img,
+        sx,
+        sy,
+        sampleSize,
+        sampleSize,
+        0,
+        0,
+        loupe.width,
+        loupe.height
+      );
+    } catch {
+      // Prevent IndexSizeError on boundary
+    }
 
     // Draw grid lines
     ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';

@@ -21,7 +21,7 @@ import {
   Sparkles,
 } from 'lucide-react';
 import { call } from './bridge';
-import { normalizedRect, rgbToHex, hexToRgb, type Capture } from './model';
+import { normalizedRect, rgbToHex, type Capture } from './model';
 
 type Point = { x: number; y: number };
 type Rect = { x: number; y: number; width: number; height: number };
@@ -49,7 +49,11 @@ const PRESET_COLORS = [
 
 const PRESET_WIDTHS = [2, 4, 8];
 
-class CaptureErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean; error: string }> {
+// Top-level ErrorBoundary to guarantee graceful fallback
+class CaptureErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  { hasError: boolean; error: string }
+> {
   constructor(props: { children: React.ReactNode }) {
     super(props);
     this.state = { hasError: false, error: '' };
@@ -57,12 +61,40 @@ class CaptureErrorBoundary extends React.Component<{ children: React.ReactNode }
   static getDerivedStateFromError(error: Error) {
     return { hasError: true, error: error.message };
   }
+  componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
+    console.error('Capture runtime error caught:', error, errorInfo);
+  }
   render() {
     if (this.state.hasError) {
       return (
-        <div style={{ position: 'fixed', inset: 0, background: '#1c2024', color: '#ffffff', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 16, zIndex: 99999 }}>
-          <p>截图界面遇到问题：{this.state.error}</p>
-          <button style={{ padding: '8px 18px', background: '#47765b', color: '#ffffff', border: 0, borderRadius: 6, cursor: 'pointer' }} onClick={() => void call('cancel_capture')}>
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: '#161a1d',
+            color: '#ffffff',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 16,
+            zIndex: 99999,
+            fontFamily: 'system-ui, -apple-system, sans-serif',
+          }}
+        >
+          <p style={{ fontSize: 14 }}>截图遇到问题：{this.state.error}</p>
+          <button
+            style={{
+              padding: '8px 20px',
+              background: '#47765b',
+              color: '#ffffff',
+              border: 0,
+              borderRadius: 6,
+              cursor: 'pointer',
+              fontSize: 13,
+            }}
+            onClick={() => void call('cancel_capture')}
+          >
             退出截图
           </button>
         </div>
@@ -73,14 +105,83 @@ class CaptureErrorBoundary extends React.Component<{ children: React.ReactNode }
 }
 
 export default function CaptureEditor({ mode }: { mode: string }) {
+  if (mode === 'pin') {
+    return (
+      <CaptureErrorBoundary>
+        <PinViewer />
+      </CaptureErrorBoundary>
+    );
+  }
+
   return (
     <CaptureErrorBoundary>
-      <CaptureEditorInner mode={mode} />
+      <CaptureScreen mode={mode} />
     </CaptureErrorBoundary>
   );
 }
 
-function CaptureEditorInner({ mode }: { mode: string }) {
+// Standalone Pin Viewer Component
+function PinViewer() {
+  const [capture, setCapture] = useState<Capture | null>(null);
+  const [opacity, setOpacity] = useState(1);
+  const [zoom, setZoom] = useState(1);
+
+  useEffect(() => {
+    void call<Capture>('pending_capture').then(setCapture).catch(() => {});
+  }, []);
+
+  return (
+    <div className="pin-window" style={{ opacity }} onDoubleClick={() => void call('edit_pin')}>
+      <div className="pin-toolbar">
+        <button aria-label="拖动贴图" onPointerDown={() => void call('drag_window')} title="拖动">
+          <Move size={14} />
+        </button>
+        <button aria-label="缩小贴图" onClick={() => setZoom(z => Math.max(0.2, z - 0.1))} title="缩小">
+          <Minus size={14} />
+        </button>
+        <button aria-label="放大贴图" onClick={() => setZoom(z => Math.min(3, z + 0.1))} title="放大">
+          <Plus size={14} />
+        </button>
+        <input
+          aria-label="贴图透明度"
+          title="透明度"
+          type="range"
+          min="0.2"
+          max="1"
+          step="0.05"
+          value={opacity}
+          onChange={e => setOpacity(+e.target.value)}
+        />
+        <button
+          aria-label="复制贴图"
+          onClick={() => {
+            if (capture) void call('capture_output', { data: capture.data, action: 'copy' });
+          }}
+          title="复制"
+        >
+          <Copy size={14} />
+        </button>
+        <button
+          aria-label="保存贴图"
+          onClick={() => {
+            if (capture) void call('capture_output', { data: capture.data, action: 'save' });
+          }}
+          title="保存"
+        >
+          <Download size={14} />
+        </button>
+        <button aria-label="关闭贴图" onClick={() => void call('close_pin')} title="关闭">
+          <X size={14} />
+        </button>
+      </div>
+      {capture && <img src={capture.data} alt="置顶参考图片" style={{ width: `${zoom * 100}%` }} />}
+    </div>
+  );
+}
+
+// Fullscreen Screenshot Capture Component
+function CaptureScreen({ mode }: { mode: string }) {
+  // 1. ALL useState Hooks at top
   const [capture, setCapture] = useState<Capture | null>(null);
   const [crop, setCrop] = useState<Rect | null>(null);
   const [activeTool, setActiveTool] = useState<string | null>(null);
@@ -99,42 +200,21 @@ function CaptureEditorInner({ mode }: { mode: string }) {
   const [busy, setBusy] = useState(false);
   const [textAt, setTextAt] = useState<Point | null>(null);
   const [textInput, setTextInput] = useState('');
-  const [showColorPalette, setShowColorPalette] = useState(false);
 
-  // Pin window properties
-  const [opacity, setOpacity] = useState(1);
-  const [zoom, setZoom] = useState(1);
-
+  // 2. ALL useRef Hooks
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
   const loupeCanvasRef = useRef<HTMLCanvasElement>(null);
+  const probeCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
-  const showToast = (msg: string) => {
+  const showToast = useCallback((msg: string) => {
     setToast(msg);
     clearTimeout(toastTimer.current);
     toastTimer.current = setTimeout(() => setToast(''), 2200);
-  };
+  }, []);
 
-  // Load pending capture data
-  useEffect(() => {
-    void call<Capture>('pending_capture')
-      .then(c => {
-        setCapture(c);
-        if (['fullscreen', 'window', 'image', 'pin'].includes(mode)) {
-          setCrop({ x: 0, y: 0, width: c.width, height: c.height });
-        }
-        const img = new Image();
-        img.onload = () => {
-          imageRef.current = img;
-          renderAnnotations();
-        };
-        img.src = c.data;
-      })
-      .catch(e => showToast(e.message));
-  }, [mode]);
-
-  // Render annotations onto crop canvas
+  // 3. useCallback for annotation rendering
   const renderAnnotations = useCallback(() => {
     const canvas = canvasRef.current;
     const img = imageRef.current;
@@ -159,24 +239,23 @@ function CaptureEditorInner({ mode }: { mode: string }) {
     }
   }, [crop, shapes, drawing]);
 
-  useEffect(() => {
-    renderAnnotations();
-  }, [renderAnnotations]);
-
-  // Current hover pixel color details for loupe
+  // 4. useMemo for current hover pixel color details (unconditional, zero allocation)
   const hoverPixelInfo = useMemo(() => {
     if (!capture || !hoverPoint || !imageRef.current) return null;
     try {
-      const offscreen = document.createElement('canvas');
-      offscreen.width = capture.width;
-      offscreen.height = capture.height;
-      const ctx = offscreen.getContext('2d');
+      if (!probeCanvasRef.current) {
+        probeCanvasRef.current = document.createElement('canvas');
+        probeCanvasRef.current.width = 1;
+        probeCanvasRef.current.height = 1;
+      }
+      const ctx = probeCanvasRef.current.getContext('2d', { willReadFrequently: true });
       if (!ctx) return null;
-      ctx.drawImage(imageRef.current, 0, 0);
 
       const pxX = Math.min(capture.width - 1, Math.max(0, Math.floor(hoverPoint.x)));
       const pxY = Math.min(capture.height - 1, Math.max(0, Math.floor(hoverPoint.y)));
-      const d = ctx.getImageData(pxX, pxY, 1, 1).data;
+      ctx.clearRect(0, 0, 1, 1);
+      ctx.drawImage(imageRef.current, pxX, pxY, 1, 1, 0, 0, 1, 1);
+      const d = ctx.getImageData(0, 0, 1, 1).data;
       const hex = rgbToHex(d[0], d[1], d[2]);
       const rgb = `RGB(${d[0]}, ${d[1]}, ${d[2]})`;
       return { pxX, pxY, hex, rgb, r: d[0], g: d[1], b: d[2] };
@@ -185,7 +264,61 @@ function CaptureEditorInner({ mode }: { mode: string }) {
     }
   }, [capture, hoverPoint]);
 
-  // Render 15x15 pixel grid onto magnifier loupe
+  // 5. useMemo for Magnifier Loupe position calculation (unconditional - NEVER placed after return)
+  const loupePosition = useMemo(() => {
+    if (!hoverPoint || !capture) return { left: 0, top: 0, show: false, crosshairX: 0, crosshairY: 0 };
+    const winW = window.innerWidth;
+    const winH = window.innerHeight;
+    const clientX = (hoverPoint.x / capture.width) * winW;
+    const clientY = (hoverPoint.y / capture.height) * winH;
+
+    const loupeW = 145;
+    const loupeH = 220;
+    const offset = 18;
+
+    let left = clientX + offset;
+    let top = clientY + offset;
+
+    if (left + loupeW > winW - 10) {
+      left = clientX - loupeW - offset;
+    }
+    if (top + loupeH > winH - 10) {
+      top = clientY - loupeH - offset;
+    }
+
+    return {
+      left: Math.max(8, left),
+      top: Math.max(8, top),
+      crosshairX: clientX,
+      crosshairY: clientY,
+      show: true,
+    };
+  }, [hoverPoint, capture]);
+
+  // 6. useEffect: Load pending capture data
+  useEffect(() => {
+    void call<Capture>('pending_capture')
+      .then(c => {
+        setCapture(c);
+        if (['fullscreen', 'window', 'image'].includes(mode)) {
+          setCrop({ x: 0, y: 0, width: c.width, height: c.height });
+        }
+        const img = new Image();
+        img.onload = () => {
+          imageRef.current = img;
+          renderAnnotations();
+        };
+        img.src = c.data;
+      })
+      .catch(e => showToast((e as Error).message || '截图载入失败'));
+  }, [mode, renderAnnotations, showToast]);
+
+  // 7. useEffect: Re-render annotations when state changes
+  useEffect(() => {
+    renderAnnotations();
+  }, [renderAnnotations]);
+
+  // 8. useEffect: Render 15x15 pixel grid onto magnifier loupe (Figure 1)
   useEffect(() => {
     if (crop || !hoverPoint || !imageRef.current || !loupeCanvasRef.current) return;
     const loupe = loupeCanvasRef.current;
@@ -199,32 +332,20 @@ function CaptureEditorInner({ mode }: { mode: string }) {
     ctx.imageSmoothingEnabled = false;
     ctx.clearRect(0, 0, loupe.width, loupe.height);
 
-    // Sample 15x15 pixels around cursor with safe boundary protection
     const sampleSize = 15;
     const half = Math.floor(sampleSize / 2);
-    const cellSize = loupe.width / sampleSize; // approx 9.3px per cell
+    const cellSize = loupe.width / sampleSize;
 
     const sx = Math.max(0, Math.min(img.width - sampleSize, pxX - half));
     const sy = Math.max(0, Math.min(img.height - sampleSize, pxY - half));
 
     try {
-      // Draw zoomed pixels safely
-      ctx.drawImage(
-        img,
-        sx,
-        sy,
-        sampleSize,
-        sampleSize,
-        0,
-        0,
-        loupe.width,
-        loupe.height
-      );
+      ctx.drawImage(img, sx, sy, sampleSize, sampleSize, 0, 0, loupe.width, loupe.height);
     } catch {
       // Prevent IndexSizeError on boundary
     }
 
-    // Draw grid lines
+    // Grid lines
     ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
     ctx.lineWidth = 1;
     for (let i = 0; i <= sampleSize; i++) {
@@ -244,7 +365,6 @@ function CaptureEditorInner({ mode }: { mode: string }) {
     ctx.strokeStyle = '#1882fc';
     ctx.lineWidth = 1.5;
 
-    // Horizontal blue line (skipping center cell)
     ctx.beginPath();
     ctx.moveTo(0, centerStart + cellSize / 2);
     ctx.lineTo(centerStart, centerStart + cellSize / 2);
@@ -252,7 +372,6 @@ function CaptureEditorInner({ mode }: { mode: string }) {
     ctx.lineTo(loupe.width, centerStart + cellSize / 2);
     ctx.stroke();
 
-    // Vertical blue line (skipping center cell)
     ctx.beginPath();
     ctx.moveTo(centerStart + cellSize / 2, 0);
     ctx.lineTo(centerStart + cellSize / 2, centerStart);
@@ -260,13 +379,12 @@ function CaptureEditorInner({ mode }: { mode: string }) {
     ctx.lineTo(centerStart + cellSize / 2, loupe.height);
     ctx.stroke();
 
-    // White outline for the center sampled pixel
     ctx.strokeStyle = '#ffffff';
     ctx.lineWidth = 1.5;
     ctx.strokeRect(centerStart, centerStart, cellSize, cellSize);
   }, [crop, hoverPoint]);
 
-  // Global keybindings
+  // 9. useEffect: Global keybindings (unconditional)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.target as HTMLElement).matches('input,textarea')) return;
@@ -309,7 +427,7 @@ function CaptureEditorInner({ mode }: { mode: string }) {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [crop, hoverPixelInfo, colorFormat, activeTool]);
+  }, [crop, hoverPixelInfo, colorFormat, activeTool, showToast]);
 
   const undoShape = () => {
     setShapes(prev => {
@@ -450,9 +568,7 @@ function CaptureEditorInner({ mode }: { mode: string }) {
     setBusy(true);
     try {
       const dataUrl = canvasRef.current.toDataURL('image/png');
-      // Trigger OCR recognition first, then forward text to quick-translate
       await call('capture_output', { data: dataUrl, action: 'ocr' });
-      // Close capture window and open quick translate
       void call('cancel_capture');
     } catch (e) {
       showToast((e as Error).message || '文字识别失败');
@@ -461,97 +577,14 @@ function CaptureEditorInner({ mode }: { mode: string }) {
     }
   };
 
-  // Pin window mode (existing floating pinned reference)
-  if (mode === 'pin') {
-    return (
-      <div className="pin-window" style={{ opacity }} onDoubleClick={() => void call('edit_pin')}>
-        <div className="pin-toolbar">
-          <button aria-label="拖动贴图" onPointerDown={() => void call('drag_window')} title="拖动">
-            <Move size={14} />
-          </button>
-          <button aria-label="缩小贴图" onClick={() => setZoom(z => Math.max(0.2, z - 0.1))} title="缩小">
-            <Minus size={14} />
-          </button>
-          <button aria-label="放大贴图" onClick={() => setZoom(z => Math.min(3, z + 0.1))} title="放大">
-            <Plus size={14} />
-          </button>
-          <input
-            aria-label="贴图透明度"
-            title="透明度"
-            type="range"
-            min="0.2"
-            max="1"
-            step="0.05"
-            value={opacity}
-            onChange={e => setOpacity(+e.target.value)}
-          />
-          <button
-            aria-label="复制贴图"
-            onClick={() => {
-              if (capture) void call('capture_output', { data: capture.data, action: 'copy' });
-            }}
-            title="复制"
-          >
-            <Copy size={14} />
-          </button>
-          <button
-            aria-label="保存贴图"
-            onClick={() => {
-              if (capture) void call('capture_output', { data: capture.data, action: 'save' });
-            }}
-            title="保存"
-          >
-            <Download size={14} />
-          </button>
-          <button aria-label="关闭贴图" onClick={() => void call('close_pin')} title="关闭">
-            <X size={14} />
-          </button>
-        </div>
-        {capture && <img src={capture.data} alt="置顶参考图片" style={{ width: `${zoom * 100}%` }} />}
-      </div>
-    );
-  }
-
+  // RENDER CONDITIONAL VIEWS AFTER ALL HOOKS
   if (!capture) {
     return (
-      <div className="capture-loading">
+      <div className="capture-loading" style={{ background: '#121619', color: '#fff' }}>
         <span>正在准备屏幕捕获…</span>
       </div>
     );
   }
-
-  // Magnifier Loupe position calculation (prevent overflowing screen)
-  const loupePosition = useMemo(() => {
-    if (!hoverPoint || !capture) return { left: 0, top: 0, show: false };
-    const winW = window.innerWidth;
-    const winH = window.innerHeight;
-    const clientX = (hoverPoint.x / capture.width) * winW;
-    const clientY = (hoverPoint.y / capture.height) * winH;
-
-    const loupeW = 145;
-    const loupeH = 220;
-    const offset = 18;
-
-    let left = clientX + offset;
-    let top = clientY + offset;
-
-    // Flip to left if near right edge
-    if (left + loupeW > winW - 10) {
-      left = clientX - loupeW - offset;
-    }
-    // Flip to top if near bottom edge
-    if (top + loupeH > winH - 10) {
-      top = clientY - loupeH - offset;
-    }
-
-    return {
-      left: Math.max(8, left),
-      top: Math.max(8, top),
-      crosshairX: clientX,
-      crosshairY: clientY,
-      show: true,
-    };
-  }, [hoverPoint, capture]);
 
   // Stage 1: Initial Selection & Figure 1 Magnifier Loupe
   if (!crop) {
@@ -665,7 +698,6 @@ function CaptureEditorInner({ mode }: { mode: string }) {
   const cropW = (crop.width / capture.width) * winW;
   const cropH = (crop.height / capture.height) * winH;
 
-  // Floating Toolbar Position (Attached to bottom-right of selection, flips if overflowing)
   const isToolbarBottom = cropTop + cropH + 52 <= winH;
   const toolbarTop = isToolbarBottom ? cropTop + cropH + 8 : Math.max(8, cropTop - 48);
   const toolbarRight = Math.max(12, winW - (cropLeft + cropW));
@@ -860,12 +892,10 @@ function CaptureEditorInner({ mode }: { mode: string }) {
           right: `${toolbarRight}px`,
         }}
       >
-        {/* Brand / Decorative Icon */}
         <div className="toolbar-brand-dot" title="dudu 截图">
           <Sparkles size={16} />
         </div>
 
-        {/* 1. Rect */}
         <button
           className={`tb-btn ${activeTool === 'rect' ? 'active' : ''}`}
           onClick={() => setActiveTool(activeTool === 'rect' ? null : 'rect')}
@@ -874,7 +904,6 @@ function CaptureEditorInner({ mode }: { mode: string }) {
           <Square size={16} />
         </button>
 
-        {/* 2. Circle */}
         <button
           className={`tb-btn ${activeTool === 'ellipse' ? 'active' : ''}`}
           onClick={() => setActiveTool(activeTool === 'ellipse' ? null : 'ellipse')}
@@ -883,7 +912,6 @@ function CaptureEditorInner({ mode }: { mode: string }) {
           <Circle size={16} />
         </button>
 
-        {/* 3. Arrow */}
         <button
           className={`tb-btn ${activeTool === 'arrow' ? 'active' : ''}`}
           onClick={() => setActiveTool(activeTool === 'arrow' ? null : 'arrow')}
@@ -892,7 +920,6 @@ function CaptureEditorInner({ mode }: { mode: string }) {
           <ArrowUpRight size={17} />
         </button>
 
-        {/* 4. Pen */}
         <button
           className={`tb-btn ${activeTool === 'pen' ? 'active' : ''}`}
           onClick={() => setActiveTool(activeTool === 'pen' ? null : 'pen')}
@@ -901,7 +928,6 @@ function CaptureEditorInner({ mode }: { mode: string }) {
           <Pen size={15} />
         </button>
 
-        {/* 5. Mosaic */}
         <button
           className={`tb-btn ${activeTool === 'mosaic' ? 'active' : ''}`}
           onClick={() => setActiveTool(activeTool === 'mosaic' ? null : 'mosaic')}
@@ -910,7 +936,6 @@ function CaptureEditorInner({ mode }: { mode: string }) {
           <Grid2X2 size={16} />
         </button>
 
-        {/* 6. Text */}
         <button
           className={`tb-btn ${activeTool === 'text' ? 'active' : ''}`}
           onClick={() => setActiveTool(activeTool === 'text' ? null : 'text')}
@@ -919,7 +944,6 @@ function CaptureEditorInner({ mode }: { mode: string }) {
           <Type size={16} />
         </button>
 
-        {/* 7. Number step */}
         <button
           className={`tb-btn ${activeTool === 'number' ? 'active' : ''}`}
           onClick={() => setActiveTool(activeTool === 'number' ? null : 'number')}
@@ -928,7 +952,6 @@ function CaptureEditorInner({ mode }: { mode: string }) {
           <Hash size={16} />
         </button>
 
-        {/* 8. Undo */}
         <button
           className="tb-btn"
           disabled={!shapes.length}
@@ -940,7 +963,6 @@ function CaptureEditorInner({ mode }: { mode: string }) {
 
         <div className="tb-divider" />
 
-        {/* 9. OCR */}
         <button
           className="tb-btn"
           disabled={busy}
@@ -950,7 +972,6 @@ function CaptureEditorInner({ mode }: { mode: string }) {
           <ScanLine size={16} />
         </button>
 
-        {/* 10. Translate */}
         <button
           className="tb-btn"
           disabled={busy}
@@ -960,7 +981,6 @@ function CaptureEditorInner({ mode }: { mode: string }) {
           <Languages size={16} />
         </button>
 
-        {/* 11. Pin */}
         <button
           className="tb-btn"
           disabled={busy}
@@ -970,7 +990,6 @@ function CaptureEditorInner({ mode }: { mode: string }) {
           <Pin size={16} />
         </button>
 
-        {/* 12. Save */}
         <button
           className="tb-btn"
           disabled={busy}
@@ -980,7 +999,6 @@ function CaptureEditorInner({ mode }: { mode: string }) {
           <Download size={16} />
         </button>
 
-        {/* 13. Cancel */}
         <button
           className="tb-btn cancel-btn"
           onClick={() => void call('cancel_capture')}
@@ -989,7 +1007,6 @@ function CaptureEditorInner({ mode }: { mode: string }) {
           <X size={17} />
         </button>
 
-        {/* 14. Finish & Copy */}
         <button
           className="tb-btn confirm-btn"
           disabled={busy}

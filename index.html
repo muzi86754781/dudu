@@ -11,15 +11,16 @@
         padding: 0;
         background: transparent;
       }
-      body:not(.window-transparent) {
+      html:not(.window-transparent),
+      html:not(.window-transparent) body {
         background-color: #f6f7f3;
       }
     </style>
     <script>
       (function() {
         if (location.search.includes('overlay=') || location.search.includes('pin=') || location.search.includes('quick-translate=')) {
+          document.documentElement.classList.add('window-transparent');
           document.documentElement.style.background = 'transparent';
-          document.body.classList.add('window-transparent');
         }
       })();
     </script>

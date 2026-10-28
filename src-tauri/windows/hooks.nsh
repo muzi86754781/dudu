@@ -11,3 +11,4 @@
   ; Run the newly installed application
   Exec '"$INSTDIR\dudu.exe"'
 !macroend
+

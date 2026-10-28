@@ -1,0 +1,107 @@
+name: Build and Release dudu
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-tauri:
+    name: Build (${{ matrix.platform }}${{ matrix.arch && format(' - {0}', matrix.arch) || '' }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+            arch: x64
+            target: ''
+            args: ''
+          - os: macos-latest
+            platform: macos
+            arch: arm64
+            target: aarch64-apple-darwin
+            args: --target aarch64-apple-darwin
+          - os: macos-latest
+            platform: macos
+            arch: x86_64
+            target: x86_64-apple-darwin
+            args: --target x86_64-apple-darwin
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target || '' }}
+
+      # Required on Windows for compiling SQLCipher (vendored OpenSSL assembly)
+      - name: Setup Strawberry Perl (Windows)
+        if: matrix.platform == 'windows'
+        uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: '5.32'
+
+      - name: Install NASM (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          choco install nasm -y
+          echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Run Frontend Tests
+        run: npm test
+
+      - name: Build Frontend
+        run: npm run build
+
+      - name: Build Tauri Package
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: v__VERSION__
+          releaseName: 'dudu v__VERSION__'
+          releaseBody: |
+            ### dudu v__VERSION__ 发布包
+
+            dudu 是一款跨平台桌面效率工具（截图 · 翻译 · 剪贴板历史一体化）。
+
+            #### 包含安装包：
+            - Windows (x64): `.exe` (NSIS 安装包) 与 `.msi`
+            - macOS (Apple Silicon arm64): `.dmg`
+            - macOS (Intel x86_64): `.dmg`
+
+            所有剪贴板记录、截图与翻译历史采用 SQLCipher 本地加密存储，隐私安全优先。
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dudu-${{ matrix.platform }}-${{ matrix.arch }}
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/*/release/bundle/dmg/*.dmg
+          if-no-files-found: warn

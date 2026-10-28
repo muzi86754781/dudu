@@ -1,0 +1,41 @@
+[package]
+name = "dudu"
+version = "0.1.0"
+description = "Local-first capture, translation and clipboard workspace"
+authors = ["dudu contributors"]
+edition = "2021"
+rust-version = "1.90"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-autostart = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.37", features = ["bundled-sqlcipher-vendored-openssl"] }
+keyring = { version = "=3.6.3", features = ["apple-native", "windows-native"] }
+arboard = "3.6"
+xcap = "=0.9.8"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+md5 = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+rfd = "0.15"
+enigo = "0.3"
+open = "5"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Media_Ocr", "Graphics_Imaging", "Storage_Streams", "Globalization", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
+panic = "unwind"

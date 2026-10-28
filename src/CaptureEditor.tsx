@@ -19,6 +19,7 @@ import {
   Plus,
   Copy,
   Sparkles,
+  ScrollText,
 } from 'lucide-react';
 import { call } from './bridge';
 import { normalizedRect, rgbToHex, type Capture } from './model';
@@ -132,14 +133,39 @@ function PinViewer() {
 
   return (
     <div className="pin-window" style={{ opacity }} onDoubleClick={() => void call('edit_pin')}>
-      <div className="pin-toolbar">
-        <button aria-label="拖动贴图" onPointerDown={() => void call('drag_window')} title="拖动">
+      <div
+        className="pin-toolbar"
+        data-tauri-drag-region
+        onPointerDown={e => {
+          if ((e.target as HTMLElement).tagName === 'BUTTON' || (e.target as HTMLElement).tagName === 'INPUT') return;
+          void call('drag_window');
+        }}
+      >
+        <button
+          aria-label="拖动贴图"
+          onPointerDown={e => {
+            e.stopPropagation();
+            void call('drag_window');
+          }}
+          title="按住拖动窗口"
+        >
           <Move size={14} />
         </button>
-        <button aria-label="缩小贴图" onClick={() => setZoom(z => Math.max(0.2, z - 0.1))} title="缩小">
+        <button
+          aria-label="缩小贴图"
+          onClick={() => setZoom(z => Math.max(0.2, +(z - 0.1).toFixed(1)))}
+          title="缩小"
+        >
           <Minus size={14} />
         </button>
-        <button aria-label="放大贴图" onClick={() => setZoom(z => Math.min(3, z + 0.1))} title="放大">
+        <span style={{ fontSize: 11, minWidth: 34, textAlign: 'center' }}>
+          {Math.round(zoom * 100)}%
+        </span>
+        <button
+          aria-label="放大贴图"
+          onClick={() => setZoom(z => Math.min(3, +(z + 0.1).toFixed(1)))}
+          title="放大"
+        >
           <Plus size={14} />
         </button>
         <input
@@ -157,7 +183,7 @@ function PinViewer() {
           onClick={() => {
             if (capture) void call('capture_output', { data: capture.data, action: 'copy' });
           }}
-          title="复制"
+          title="复制图片"
         >
           <Copy size={14} />
         </button>
@@ -166,15 +192,27 @@ function PinViewer() {
           onClick={() => {
             if (capture) void call('capture_output', { data: capture.data, action: 'save' });
           }}
-          title="保存"
+          title="保存为文件"
         >
           <Download size={14} />
         </button>
-        <button aria-label="关闭贴图" onClick={() => void call('close_pin')} title="关闭">
+        <button aria-label="关闭贴图" onClick={() => void call('close_pin')} title="关闭贴图 (Esc)">
           <X size={14} />
         </button>
       </div>
-      {capture && <img src={capture.data} alt="置顶参考图片" style={{ width: `${zoom * 100}%` }} />}
+
+      <div className="pin-image-wrapper">
+        {capture ? (
+          <img
+            src={capture.data}
+            alt="置顶贴图"
+            style={{ width: `${zoom * 100}%` }}
+            draggable={false}
+          />
+        ) : (
+          <span style={{ fontSize: 12, color: '#666' }}>正在准备贴图…</span>
+        )}
+      </div>
     </div>
   );
 }
@@ -200,12 +238,19 @@ function CaptureScreen({ mode }: { mode: string }) {
   const [busy, setBusy] = useState(false);
   const [textAt, setTextAt] = useState<Point | null>(null);
   const [textInput, setTextInput] = useState('');
+  const [isLongCapturing, setIsLongCapturing] = useState(false);
+  const [longPageCount, setLongPageCount] = useState(1);
+  const [longPreviewUrl, setLongPreviewUrl] = useState<string | null>(null);
+  const [autoScrolling, setAutoScrolling] = useState(false);
+  const [lastDragY, setLastDragY] = useState<number | null>(null);
 
   // 2. ALL useRef Hooks
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
   const loupeCanvasRef = useRef<HTMLCanvasElement>(null);
   const probeCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const longCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const autoScrollTimer = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   const showToast = useCallback((msg: string) => {
@@ -384,12 +429,161 @@ function CaptureScreen({ mode }: { mode: string }) {
     ctx.strokeRect(centerStart, centerStart, cellSize, cellSize);
   }, [crop, hoverPoint]);
 
-  // 9. useEffect: Global keybindings (unconditional)
+  // 9. Callbacks for Long Screenshot
+  const startLongCapture = useCallback(() => {
+    if (!crop || !imageRef.current) return;
+    setIsLongCapturing(true);
+    setLongPageCount(1);
+
+    const c = document.createElement('canvas');
+    c.width = crop.width;
+    c.height = crop.height;
+    const ctx = c.getContext('2d');
+    if (ctx && imageRef.current) {
+      ctx.drawImage(
+        imageRef.current,
+        crop.x,
+        crop.y,
+        crop.width,
+        crop.height,
+        0,
+        0,
+        crop.width,
+        crop.height
+      );
+      longCanvasRef.current = c;
+      setLongPreviewUrl(c.toDataURL('image/png'));
+    }
+    showToast('长截图已开启：滚动鼠标滚轮 或 向下拖拽页面实时拼接');
+  }, [crop, showToast]);
+
+  const stitchNewSlice = useCallback(
+    (newSliceImg: HTMLImageElement) => {
+      if (!longCanvasRef.current || !crop) return;
+      const prevCanvas = longCanvasRef.current;
+      const W = prevCanvas.width;
+      const H1 = prevCanvas.height;
+      const H2 = newSliceImg.height;
+
+      const maxOverlap = Math.min(H2 - 20, Math.floor(H2 * 0.7));
+      const minOverlap = 20;
+      let bestOverlap = Math.floor(H2 * 0.35);
+
+      try {
+        const prevCtx = prevCanvas.getContext('2d');
+        const sliceCanvas = document.createElement('canvas');
+        sliceCanvas.width = W;
+        sliceCanvas.height = H2;
+        const sliceCtx = sliceCanvas.getContext('2d');
+        if (prevCtx && sliceCtx) {
+          sliceCtx.drawImage(newSliceImg, 0, 0);
+
+          let minDiff = Infinity;
+          for (let candidate = minOverlap; candidate <= maxOverlap; candidate += 4) {
+            const row1 = prevCtx.getImageData(0, H1 - candidate, Math.min(W, 80), 1).data;
+            const row2 = sliceCtx.getImageData(0, 0, Math.min(W, 80), 1).data;
+            let diff = 0;
+            for (let i = 0; i < row1.length; i += 4) {
+              diff +=
+                Math.abs(row1[i] - row2[i]) +
+                Math.abs(row1[i + 1] - row2[i + 1]) +
+                Math.abs(row1[i + 2] - row2[i + 2]);
+            }
+            if (diff < minDiff) {
+              minDiff = diff;
+              bestOverlap = candidate;
+            }
+          }
+        }
+      } catch {
+        // fallback
+      }
+
+      const appendHeight = Math.max(30, H2 - bestOverlap);
+      const newTotalHeight = H1 + appendHeight;
+
+      const newCanvas = document.createElement('canvas');
+      newCanvas.width = W;
+      newCanvas.height = Math.min(18000, newTotalHeight);
+      const newCtx = newCanvas.getContext('2d');
+      if (!newCtx) return;
+
+      newCtx.drawImage(prevCanvas, 0, 0);
+      newCtx.drawImage(newSliceImg, 0, bestOverlap, W, appendHeight, 0, H1, W, appendHeight);
+
+      longCanvasRef.current = newCanvas;
+      const url = newCanvas.toDataURL('image/png');
+      setLongPreviewUrl(url);
+      setLongPageCount(prev => prev + 1);
+
+      if (canvasRef.current) {
+        canvasRef.current.width = W;
+        canvasRef.current.height = newCanvas.height;
+        const cCtx = canvasRef.current.getContext('2d');
+        if (cCtx) cCtx.drawImage(newCanvas, 0, 0);
+      }
+    },
+    [crop]
+  );
+
+  const triggerScrollAndStitch = useCallback(
+    async (delta: number) => {
+      if (!crop || busy) return;
+      setBusy(true);
+      try {
+        const slice = await call<Capture>('scroll_and_capture_slice', {
+          delta,
+          x: Math.round(crop.x),
+          y: Math.round(crop.y),
+          width: Math.round(crop.width),
+          height: Math.round(crop.height),
+        });
+        const img = new Image();
+        img.onload = () => {
+          stitchNewSlice(img);
+          setBusy(false);
+        };
+        img.onerror = () => setBusy(false);
+        img.src = slice.data;
+      } catch {
+        setBusy(false);
+      }
+    },
+    [crop, busy, stitchNewSlice]
+  );
+
+  const finishLongCapture = useCallback(async () => {
+    clearInterval(autoScrollTimer.current);
+    setAutoScrolling(false);
+    if (!longCanvasRef.current) {
+      setIsLongCapturing(false);
+      return;
+    }
+    const dataUrl = longCanvasRef.current.toDataURL('image/png');
+    await call('capture_output', { data: dataUrl, action: 'copy' });
+  }, []);
+
+  // Ensure window keyboard focus
+  useEffect(() => {
+    window.focus();
+  }, []);
+
+  // 10. useEffect: Global keybindings (unconditional)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.target as HTMLElement).matches('input,textarea')) return;
 
       if (e.key === 'Escape') {
+        if (textAt) {
+          setTextAt(null);
+          return;
+        }
+        if (isLongCapturing) {
+          clearInterval(autoScrollTimer.current);
+          setAutoScrolling(false);
+          setIsLongCapturing(false);
+          return;
+        }
         if (activeTool) {
           setActiveTool(null);
           return;
@@ -400,7 +594,11 @@ function CaptureScreen({ mode }: { mode: string }) {
       // Enter to finish and copy
       if (e.key === 'Enter' && crop) {
         e.preventDefault();
-        void handleOutput('copy');
+        if (isLongCapturing) {
+          void finishLongCapture();
+        } else {
+          void handleOutput('copy');
+        }
       }
 
       // 'C' key in stage 1 to copy hover color
@@ -427,7 +625,16 @@ function CaptureScreen({ mode }: { mode: string }) {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [crop, hoverPixelInfo, colorFormat, activeTool, showToast]);
+  }, [
+    crop,
+    hoverPixelInfo,
+    colorFormat,
+    activeTool,
+    isLongCapturing,
+    textAt,
+    showToast,
+    finishLongCapture,
+  ]);
 
   const undoShape = () => {
     setShapes(prev => {
@@ -506,6 +713,16 @@ function CaptureScreen({ mode }: { mode: string }) {
     const current = getScreenPoint(e);
     setHoverPoint(current);
 
+    if (isLongCapturing && e.buttons === 1) {
+      if (lastDragY !== null && e.clientY - lastDragY > 25) {
+        setLastDragY(e.clientY);
+        void triggerScrollAndStitch(-3);
+      } else if (lastDragY === null) {
+        setLastDragY(e.clientY);
+      }
+      return;
+    }
+
     if (resizingHandle && resizeStart && capture) {
       const dx = current.x - resizeStart.mouse.x;
       const dy = current.y - resizeStart.mouse.y;
@@ -544,6 +761,7 @@ function CaptureScreen({ mode }: { mode: string }) {
   };
 
   const handleStage2PointerUp = () => {
+    setLastDragY(null);
     setResizingHandle(null);
     setResizeStart(null);
   };
@@ -707,6 +925,11 @@ function CaptureScreen({ mode }: { mode: string }) {
       className="screen-capture-viewport stage-2"
       onPointerMove={handleStage2PointerMove}
       onPointerUp={handleStage2PointerUp}
+      onWheel={e => {
+        if (isLongCapturing && e.deltaY > 15) {
+          void triggerScrollAndStitch(-3);
+        }
+      }}
       onContextMenu={e => {
         e.preventDefault();
         void call('cancel_capture');
@@ -887,6 +1110,8 @@ function CaptureScreen({ mode }: { mode: string }) {
       {/* Figure 2: White Floating Pill Toolbar Attached to Selection */}
       <div
         className="floating-toolbar-pill"
+        onPointerDown={e => e.stopPropagation()}
+        onMouseDown={e => e.stopPropagation()}
         style={{
           top: `${toolbarTop}px`,
           right: `${toolbarRight}px`,
@@ -963,6 +1188,18 @@ function CaptureScreen({ mode }: { mode: string }) {
 
         <div className="tb-divider" />
 
+        {/* Long Screenshot (滚轮/拖动拼接) */}
+        <button
+          className={`tb-btn ${isLongCapturing ? 'active' : ''}`}
+          onClick={() => {
+            if (!isLongCapturing) startLongCapture();
+            else void finishLongCapture();
+          }}
+          title={isLongCapturing ? '完成长截图 (Enter)' : '长截图 (滚轮滚动/拖动页面拼接)'}
+        >
+          <ScrollText size={16} />
+        </button>
+
         <button
           className="tb-btn"
           disabled={busy}
@@ -1001,7 +1238,14 @@ function CaptureScreen({ mode }: { mode: string }) {
 
         <button
           className="tb-btn cancel-btn"
-          onClick={() => void call('cancel_capture')}
+          onPointerDown={e => {
+            e.stopPropagation();
+            void call('cancel_capture');
+          }}
+          onClick={e => {
+            e.stopPropagation();
+            void call('cancel_capture');
+          }}
           title="取消截图 (Esc)"
         >
           <X size={17} />
@@ -1010,12 +1254,68 @@ function CaptureScreen({ mode }: { mode: string }) {
         <button
           className="tb-btn confirm-btn"
           disabled={busy}
-          onClick={() => void handleOutput('copy')}
+          onClick={() => {
+            if (isLongCapturing) void finishLongCapture();
+            else void handleOutput('copy');
+          }}
           title="完成截图并复制 (Enter / 双击)"
         >
           <Check size={18} />
         </button>
       </div>
+
+      {/* Long Screenshot Control Banner */}
+      {isLongCapturing && (
+        <div className="long-capture-banner" onPointerDown={e => e.stopPropagation()}>
+          <span className="long-badge">长截图模式 · 第 {longPageCount} 屏</span>
+          <span>鼠标滚轮滚动 或 鼠标按住左键向下拖动页面实时拼接</span>
+          <button
+            className="long-action-btn"
+            onClick={() => {
+              if (autoScrolling) {
+                clearInterval(autoScrollTimer.current);
+                setAutoScrolling(false);
+              } else {
+                setAutoScrolling(true);
+                autoScrollTimer.current = setInterval(() => {
+                  void triggerScrollAndStitch(-3);
+                }, 450);
+              }
+            }}
+          >
+            {autoScrolling ? '暂停滚动' : '自动滚动'}
+          </button>
+          <button className="long-action-btn finish-btn" onClick={() => void finishLongCapture()}>
+            <Check size={14} /> 完成长截图并复制 (Enter)
+          </button>
+          <button
+            className="long-action-btn"
+            onClick={() => {
+              clearInterval(autoScrollTimer.current);
+              setAutoScrolling(false);
+              setIsLongCapturing(false);
+            }}
+            title="退出长截图"
+          >
+            <X size={14} />
+          </button>
+        </div>
+      )}
+
+      {/* Long Screenshot Live Preview Drawer */}
+      {isLongCapturing && longPreviewUrl && (
+        <div className="long-preview-drawer" onPointerDown={e => e.stopPropagation()}>
+          <div className="long-preview-header">
+            <span>长截图实时预览</span>
+            <span>
+              {crop.width} × {longCanvasRef.current?.height || crop.height} px
+            </span>
+          </div>
+          <div className="long-preview-body">
+            <img src={longPreviewUrl} alt="长截图预览" draggable={false} />
+          </div>
+        </div>
+      )}
 
       {/* Modal for Text Annotation Input */}
       {textAt && (

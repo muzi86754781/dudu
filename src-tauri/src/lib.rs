@@ -3,7 +3,7 @@ mod store;
 
 use arboard::Clipboard;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use enigo::{Direction, Enigo, Key, Keyboard, Settings as InputSettings};
+use enigo::{Axis, Direction, Enigo, Key, Keyboard, Mouse, Settings as InputSettings};
 use image::{DynamicImage, GenericImageView, ImageFormat, ImageReader, RgbaImage};
 use model::{err, now, Capture, Clip, Result, Settings, Status, Translation};
 use serde::Deserialize;
@@ -875,8 +875,14 @@ fn capture_output(
         }
         "pin" => {
             *state.capture.write().map_err(err)? = Some(image.to_rgba8());
+            *state.capture_cache.write().map_err(err)? = Some(Capture {
+                data: data.clone(),
+                width: w,
+                height: h,
+            });
             if let Some(w) = app.get_webview_window("pin-1") {
-                let _ = w.close();
+                let _ = w.hide();
+                let _ = w.destroy();
             }
             let url = WebviewUrl::App("index.html?pin=1".into());
             WebviewWindowBuilder::new(&app, "pin-1", url)
@@ -884,16 +890,15 @@ fn capture_output(
                 .decorations(false)
                 .always_on_top(true)
                 .skip_taskbar(true)
-                .inner_size((w.min(800)) as f64, (h.min(600)) as f64)
+                .inner_size((w.min(1200)) as f64, (h.min(900)) as f64)
                 .build()
                 .map_err(err)?;
         }
         _ => return Err("未知图片操作".into()),
     }
-    if action != "pin" {
-        if let Some(w) = app.get_webview_window("capture") {
-            let _ = w.close();
-        }
+    if let Some(w) = app.get_webview_window("capture") {
+        let _ = w.hide();
+        let _ = w.destroy();
     }
     Ok(())
 }
@@ -903,14 +908,16 @@ fn edit_pin(app: tauri::AppHandle) -> Result<()> {
     let Some(pin) = app.get_webview_window("pin-1") else {
         return Err("贴图窗口已关闭".into());
     };
-    let _ = pin.close();
+    let _ = pin.hide();
+    let _ = pin.destroy();
     show_main(&app)
 }
 
 #[tauri::command]
 fn close_pin(app: tauri::AppHandle) -> Result<()> {
     if let Some(w) = app.get_webview_window("pin-1") {
-        w.close().map_err(err)?
+        let _ = w.hide();
+        let _ = w.destroy();
     }
     Ok(())
 }
@@ -931,7 +938,8 @@ fn capture_color(app: tauri::AppHandle, color: String) -> Result<()> {
     Clipboard::new().map_err(err)?.set_text(color.clone()).map_err(err)?;
     let _ = app.emit("color", color);
     if let Some(w) = app.get_webview_window("capture") {
-        let _ = w.close();
+        let _ = w.hide();
+        let _ = w.destroy();
     }
     Ok(())
 }
@@ -939,9 +947,49 @@ fn capture_color(app: tauri::AppHandle, color: String) -> Result<()> {
 #[tauri::command]
 fn cancel_capture(app: tauri::AppHandle) -> Result<()> {
     if let Some(w) = app.get_webview_window("capture") {
-        let _ = w.close().map_err(err)?;
+        let _ = w.hide();
+        let _ = w.destroy();
     }
     Ok(())
+}
+
+#[tauri::command]
+fn scroll_target_page(delta: i32) -> Result<()> {
+    let mut e = Enigo::new(&InputSettings::default()).map_err(err)?;
+    e.scroll(delta, Axis::Vertical).map_err(err)
+}
+
+#[tauri::command]
+fn scroll_and_capture_slice(
+    delta: i32,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> Result<Capture> {
+    let mut e = Enigo::new(&InputSettings::default()).map_err(err)?;
+    let _ = e.scroll(delta, Axis::Vertical);
+
+    // Sleep briefly so target application can repaint the scrolled content
+    std::thread::sleep(std::time::Duration::from_millis(160));
+
+    let monitors = xcap::Monitor::all().map_err(err)?;
+    let primary = monitors
+        .iter()
+        .find(|m| m.is_primary().unwrap_or(false))
+        .unwrap_or(&monitors[0]);
+    let img = primary.capture_image().map_err(err)?;
+
+    let sub_w = width.min(img.width().saturating_sub(x));
+    let sub_h = height.min(img.height().saturating_sub(y));
+    let sub = image::imageops::crop_imm(&img, x, y, sub_w, sub_h).to_image();
+    let bytes = encode_png(&sub)?;
+
+    Ok(Capture {
+        data: format!("data:image/png;base64,{}", BASE64.encode(bytes)),
+        width: sub_w,
+        height: sub_h,
+    })
 }
 
 #[tauri::command]
@@ -1590,6 +1638,8 @@ pub fn run() {
             drag_window,
             capture_color,
             cancel_capture,
+            scroll_target_page,
+            scroll_and_capture_slice,
             hide_main,
             list_windows,
             open_image,

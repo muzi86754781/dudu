@@ -70,7 +70,7 @@ export default function App() {
     ready: false,
     error: '',
     shortcutErrors: [],
-    version: '0.1.4',
+    version: '0.1.5',
     platform: '',
   });
   const [toast, setToast] = useState('');

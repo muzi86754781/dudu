@@ -1,4 +1,4 @@
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -38,13 +38,21 @@ pub fn get_temp_log_file() -> PathBuf {
 pub fn init_logger() {
     let p1 = get_primary_log_file();
     let p2 = get_temp_log_file();
-    log_info!(
+    log_raw(
+        "INFO",
         "system",
-        "=== dudu application started (Version: {}) ===",
-        env!("CARGO_PKG_VERSION")
+        &format!("=== dudu application started (Version: {}) ===", env!("CARGO_PKG_VERSION")),
     );
-    log_info!("system", "Primary log path: {}", p1.display());
-    log_info!("system", "Temp log path: {}", p2.display());
+    log_raw(
+        "INFO",
+        "system",
+        &format!("Primary log path: {}", p1.display()),
+    );
+    log_raw(
+        "INFO",
+        "system",
+        &format!("Temp log path: {}", p2.display()),
+    );
 }
 
 pub fn log_raw(level: &str, target: &str, message: &str) {
@@ -72,13 +80,11 @@ pub fn log_raw(level: &str, target: &str, message: &str) {
 }
 
 fn chrono_timestamp() -> String {
-    // Lightweight millisecond timestamp without pulling huge dependencies
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     let total_secs = now.as_secs();
     let millis = now.subsec_millis();
 
-    // Standard date-time calculation for UTC/local approximate
     let secs = total_secs % 86400;
     let hours = (secs / 3600 + 8) % 24; // Default to UTC+8 for Chinese users
     let mins = (secs % 3600) / 60;

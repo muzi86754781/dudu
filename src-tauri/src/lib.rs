@@ -1661,7 +1661,7 @@ fn build_tray<R: tauri::Runtime>(app: &tauri::App<R>, settings: &Settings) -> ta
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let app = tauri::Builder::default()
+    tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             let _ = show_main(app);
         }))

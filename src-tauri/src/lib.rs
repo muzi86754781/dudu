@@ -6,7 +6,6 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use enigo::{Direction, Enigo, Key, Keyboard, Settings as InputSettings};
 use image::{DynamicImage, GenericImageView, ImageFormat, ImageReader, RgbaImage};
 use model::{err, now, Capture, Clip, Result, Settings, Status, Translation};
-use rusqlite::OptionalExtension;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -21,6 +20,7 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindowBuilder,
 };
+use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 struct AppState {
@@ -61,24 +61,27 @@ fn get_settings(state: tauri::State<'_, AppState>) -> Result<Settings> {
     state.settings()
 }
 
-fn register_shortcuts<R: tauri::Runtime>(app: &tauri::AppHandle<R>, settings: &Settings) -> Vec<String> {
+fn register_shortcuts<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    settings: &Settings,
+) -> Vec<String> {
     let manager = app.global_shortcut();
     let _ = manager.unregister_all();
     let mut errors = Vec::new();
     for (id, accelerator) in &settings.shortcuts {
-        let id = id.clone();
+        let action_id = id.clone();
         let app_clone = app.clone();
         if let Err(e) = manager.on_shortcut(accelerator.as_str(), move |_app, _shortcut, event| {
             if event.state != ShortcutState::Pressed {
                 return;
             }
-            match id.as_str() {
+            match action_id.as_str() {
                 "clipboard" => {
                     let _ = app_clone.emit("navigate", "clipboard");
                     let _ = show_main(&app_clone);
                 }
                 "region" | "window" | "fullscreen" | "ocr" | "color" => {
-                    let mode = id.clone();
+                    let mode = action_id.clone();
                     let a = app_clone.clone();
                     std::thread::spawn(move || {
                         if let Err(e) = capture_start(&a, &mode, 0, None) {
@@ -397,18 +400,26 @@ async fn translate(
     Ok(tr)
 }
 
+fn google_lang(s: &str) -> &str {
+    if s == "auto" {
+        "auto"
+    } else {
+        s
+    }
+}
+
 async fn google_translate(
     client: &reqwest::Client,
     text: &str,
     from: &str,
     to: &str,
 ) -> Result<String> {
-    let lang = |s: &str| if s == "auto" { "auto" } else { s };
+    let sl = google_lang(from);
     let response = client
         .get("https://translate.googleapis.com/translate_a/single")
         .query(&[
             ("client", "gtx"),
-            ("sl", lang(from)),
+            ("sl", sl),
             ("tl", to),
             ("dt", "t"),
             ("q", text),
@@ -478,6 +489,15 @@ async fn deepl_translate(
         .ok_or_else(|| "DeepL 未返回译文".into())
 }
 
+fn baidu_lang(s: &str) -> &str {
+    match s {
+        "auto" => "auto",
+        "zh-CN" => "zh",
+        "zh-TW" => "cht",
+        v => v,
+    }
+}
+
 async fn baidu_translate(
     client: &reqwest::Client,
     text: &str,
@@ -486,20 +506,16 @@ async fn baidu_translate(
     app_id: &str,
     key: &str,
 ) -> Result<String> {
-    let lang = |s: &str| match s {
-        "auto" => "auto".to_owned(),
-        "zh-CN" => "zh".into(),
-        "zh-TW" => "cht".into(),
-        v => v.to_owned(),
-    };
+    let from_mapped = baidu_lang(from);
+    let to_mapped = baidu_lang(to);
     let salt = uuid::Uuid::new_v4().simple().to_string();
     let signature = format!("{:x}", md5::compute(format!("{app_id}{text}{salt}{key}")));
     let response = client
         .get("https://fanyi-api.baidu.com/api/trans/vip/translate")
         .query(&[
             ("q", text),
-            ("from", &lang(from)),
-            ("to", &lang(to)),
+            ("from", from_mapped),
+            ("to", to_mapped),
             ("appid", app_id),
             ("salt", &salt),
             ("sign", &signature),
@@ -524,6 +540,22 @@ async fn baidu_translate(
         })
         .filter(|v| !v.is_empty())
         .ok_or_else(|| "百度翻译未返回译文".into())
+}
+
+fn youdao_lang(s: &str) -> &str {
+    match s {
+        "auto" => "auto",
+        "zh-CN" => "zh-CHS",
+        "zh-TW" => "zh-CHT",
+        "ja" => "ja",
+        "en" => "en",
+        "ko" => "ko",
+        "fr" => "fr",
+        "de" => "de",
+        "es" => "es",
+        "ru" => "ru",
+        v => v,
+    }
 }
 
 async fn youdao_translate(
@@ -551,26 +583,15 @@ async fn youdao_translate(
     hasher.update(sign_str.as_bytes());
     let sign = format!("{:x}", hasher.finalize());
 
-    let lang = |s: &str| match s {
-        "auto" => "auto",
-        "zh-CN" => "zh-CHS",
-        "zh-TW" => "zh-CHT",
-        "ja" => "ja",
-        "en" => "en",
-        "ko" => "ko",
-        "fr" => "fr",
-        "de" => "de",
-        "es" => "es",
-        "ru" => "ru",
-        v => v,
-    };
+    let from_mapped = youdao_lang(from);
+    let to_mapped = youdao_lang(to);
 
     let response = client
         .post("https://openapi.youdao.com/api")
         .form(&[
             ("q", text),
-            ("from", lang(from)),
-            ("to", lang(to)),
+            ("from", from_mapped),
+            ("to", to_mapped),
             ("appKey", app_key),
             ("salt", &salt),
             ("sign", &sign),
@@ -1021,7 +1042,7 @@ fn import_data(state: tauri::State<'_, AppState>) -> Result<Vec<Clip>> {
         return Err("备份版本不兼容或包含过多记录".into());
     }
     backup.settings.validate()?;
-    let mut db = state.db.lock().map_err(err)?;
+    let db = state.db.lock().map_err(err)?;
     for c in backup.clipboard {
         if c.id.is_empty()
             || c.id.len() > 64
@@ -1061,7 +1082,7 @@ fn image_preview(content: &str) -> Result<String> {
         .decode()
         .map_err(|_| "图片记录损坏".to_string())?;
     if img.width() as u64 * img.height() as u64 > 40_000_000 {
-        return Err("备份中的图片分辨率超限".into());
+        return Err("备份中的图片分辨率超限".into())
     }
     let thumbnail = img.thumbnail(320, 200).to_rgba8();
     let mut data = Cursor::new(Vec::new());
@@ -1092,9 +1113,7 @@ fn ocr(image: &DynamicImage) -> Result<String> {
     stream.Seek(0).map_err(err)?;
     let decoder = BitmapDecoder::CreateAsync(&stream).map_err(err)?.get().map_err(err)?;
     let bitmap = decoder.GetSoftwareBitmapAsync().map_err(err)?.get().map_err(err)?;
-    let engine = OcrEngine::TryCreateFromUserProfileLanguages().map_err(err)?.ok_or(
-        "Windows 没有安装可用的 OCR 语言包，请在系统语言设置中添加中文或英文".to_string(),
-    )?;
+    let engine = OcrEngine::TryCreateFromUserProfileLanguages().map_err(err)?;
     let result = engine.RecognizeAsync(&bitmap).map_err(err)?.get().map_err(err)?;
     Ok(result.Text().map_err(err)?.to_string())
 }
@@ -1187,15 +1206,8 @@ fn start_listener(app: tauri::AppHandle, db_path: PathBuf) {
                             favorite: false,
                         };
                         if let Some(s) = app.try_state::<AppState>() {
-                            if let Ok(mut db) = s.db.lock() {
-                                let duplicate: rusqlite::Result<Option<i64>> = db
-                                    .query_row(
-                                        "SELECT created FROM clipboard_items WHERE kind='text' AND content=?1 ORDER BY created DESC LIMIT 1",
-                                        [&text],
-                                        |r| r.get(0),
-                                    )
-                                    .optional();
-                                if !matches!(duplicate, Ok(Some(t)) if now() - t < 300000) {
+                            if let Ok(db) = s.db.lock() {
+                                if !db.is_recent_duplicate("text", &text, 300_000) {
                                     let _ = db.insert(&c, "", settings.limit);
                                     last_text = text.clone();
                                     let _ = app.emit("clips", s.clips(false).unwrap_or_default());
@@ -1240,7 +1252,7 @@ fn start_listener(app: tauri::AppHandle, db_path: PathBuf) {
                                 };
                                 let preview = image_preview(&data).unwrap_or_default();
                                 if let Some(s) = app.try_state::<AppState>() {
-                                    if let Ok(mut db) = s.db.lock() {
+                                    if let Ok(db) = s.db.lock() {
                                         if db.insert(&c, &preview, settings.limit).is_ok() {
                                             last_image = hash;
                                             let _ = app.emit(

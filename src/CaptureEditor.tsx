@@ -21,7 +21,7 @@ import {
   Sparkles,
   ScrollText,
 } from 'lucide-react';
-import { call } from './bridge';
+import { call, on } from './bridge';
 import { normalizedRect, rgbToHex, type Capture } from './model';
 
 type Point = { x: number; y: number };
@@ -340,23 +340,68 @@ function CaptureScreen({ mode }: { mode: string }) {
     };
   }, [hoverPoint, capture]);
 
-  // 6. useEffect: Load pending capture data
+  // 6. useEffect: Load pending capture data & listen to new captures
   useEffect(() => {
+    let cancelled = false;
+    void call('frontend_log', {
+      level: 'INFO',
+      tag: 'capture_ui',
+      message: `CaptureScreen mounted with mode=${mode}`,
+    });
+
+    const handleLoadedCapture = (c: Capture) => {
+      if (cancelled) return;
+      void call('frontend_log', {
+        level: 'INFO',
+        tag: 'capture_ui',
+        message: `Capture data received: ${c.width}x${c.height}`,
+      });
+      setCapture(c);
+      if (['fullscreen', 'window', 'image'].includes(mode)) {
+        setCrop({ x: 0, y: 0, width: c.width, height: c.height });
+      } else {
+        setCrop(null);
+      }
+      setShapes([]);
+      setRedo([]);
+      setActiveTool(null);
+
+      const img = new Image();
+      img.onload = () => {
+        if (cancelled) return;
+        imageRef.current = img;
+        void call('frontend_log', {
+          level: 'INFO',
+          tag: 'capture_ui',
+          message: 'Preview image decoded and ready in DOM',
+        });
+      };
+      img.src = c.data;
+    };
+
     void call<Capture>('pending_capture')
-      .then(c => {
-        setCapture(c);
-        if (['fullscreen', 'window', 'image'].includes(mode)) {
-          setCrop({ x: 0, y: 0, width: c.width, height: c.height });
+      .then(handleLoadedCapture)
+      .catch(e => {
+        if (!cancelled) {
+          const msg = (e as Error).message || '截图载入失败';
+          void call('frontend_log', {
+            level: 'ERROR',
+            tag: 'capture_ui',
+            message: `pending_capture failed: ${msg}`,
+          });
+          showToast(msg);
         }
-        const img = new Image();
-        img.onload = () => {
-          imageRef.current = img;
-          renderAnnotations();
-        };
-        img.src = c.data;
-      })
-      .catch(e => showToast((e as Error).message || '截图载入失败'));
-  }, [mode, renderAnnotations, showToast]);
+      });
+
+    const unlisten = on<Capture>('capture-ready', c => {
+      handleLoadedCapture(c);
+    });
+
+    return () => {
+      cancelled = true;
+      void unlisten.then(f => f());
+    };
+  }, [mode, showToast]);
 
   // 7. useEffect: Re-render annotations when state changes
   useEffect(() => {
@@ -798,8 +843,33 @@ function CaptureScreen({ mode }: { mode: string }) {
   // RENDER CONDITIONAL VIEWS AFTER ALL HOOKS
   if (!capture) {
     return (
-      <div className="capture-loading" style={{ background: '#121619', color: '#fff' }}>
-        <span>正在准备屏幕捕获…</span>
+      <div
+        className="capture-loading"
+        style={{
+          background: '#121619',
+          color: '#fff',
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          gap: 16,
+        }}
+      >
+        <span style={{ fontSize: 14 }}>正在准备屏幕捕获…</span>
+        <button
+          onClick={() => void call('cancel_capture')}
+          style={{
+            padding: '6px 16px',
+            background: 'rgba(255, 255, 255, 0.12)',
+            border: '1px solid rgba(255, 255, 255, 0.25)',
+            borderRadius: 6,
+            color: '#ffffff',
+            cursor: 'pointer',
+            fontSize: 12,
+          }}
+        >
+          取消退出 (Esc)
+        </button>
       </div>
     );
   }

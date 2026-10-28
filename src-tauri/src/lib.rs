@@ -1,3 +1,5 @@
+#[macro_use]
+pub mod logger;
 mod model;
 mod store;
 
@@ -78,29 +80,38 @@ fn register_shortcuts<R: tauri::Runtime>(
             }
             match action_id.as_str() {
                 "clipboard" => {
+                    log_info!("shortcut", "快捷键触发: 剪贴板历史");
                     let _ = app_clone.emit("navigate", "clipboard");
                     let _ = show_main(&app_clone);
                 }
                 "region" | "window" | "fullscreen" | "ocr" | "color" => {
                     let mode = action_id.clone();
                     let a = app_clone.clone();
+                    log_info!("shortcut", "快捷键触发截图: 模式={}", mode);
                     std::thread::spawn(move || {
                         if let Err(e) = capture_start(&a, &mode, 0, None) {
+                            log_error!("shortcut", "截图启动失败: {}", e);
                             let _ = a.emit("error", e);
                         }
                     });
                 }
                 "translate" => {
                     let a = app_clone.clone();
+                    log_info!("shortcut", "快捷键触发: 独立翻译窗口");
                     std::thread::spawn(move || {
-                        let _ = show_quick_translate(&a, None);
+                        if let Err(e) = show_quick_translate(&a, None) {
+                            log_error!("shortcut", "唤起快速翻译窗口失败: {}", e);
+                        }
                     });
                 }
                 "selection" => {
                     let a = app_clone.clone();
+                    log_info!("shortcut", "快捷键触发: 划词翻译");
                     std::thread::spawn(move || {
                         let text = selected_text().ok();
-                        let _ = show_quick_translate(&a, text);
+                        if let Err(e) = show_quick_translate(&a, text) {
+                            log_error!("shortcut", "唤起划词翻译失败: {}", e);
+                        }
                     });
                 }
                 _ => {}
@@ -707,23 +718,29 @@ fn capture_start_with_state<R: tauri::Runtime>(
     delay: u64,
     window_id: Option<u32>,
 ) -> Result<()> {
+    log_info!("capture", "发起截图请求: 模式={}, 延迟={}s", mode, delay);
     if !["region", "window", "fullscreen", "ocr", "color"].contains(&mode) {
+        log_error!("capture", "未知截图方式: {}", mode);
         return Err("未知截图方式".into());
     }
     if !state.settings()?.consent {
+        log_warn!("capture", "用户尚未同意隐私说明，已拦截截图");
         return Err("请先同意隐私说明".into());
     }
     if let Some(w) = app.get_webview_window("main") {
-        w.hide().map_err(err)?
+        let _ = w.hide();
     }
     if delay > 0 {
-        std::thread::sleep(std::time::Duration::from_secs(delay.min(10)))
+        std::thread::sleep(std::time::Duration::from_secs(delay.min(10)));
     }
-    std::thread::sleep(std::time::Duration::from_millis(230));
-    let monitors = xcap::Monitor::all().map_err(|_| {
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    let t_start = std::time::Instant::now();
+    let monitors = xcap::Monitor::all().map_err(|e| {
+        log_error!("capture", "获取显示器列表失败: {}", e);
         "无法捕获屏幕。请在系统设置中授权屏幕录制，然后重新打开 dudu".to_string()
     })?;
     if monitors.is_empty() {
+        log_error!("capture", "未检测到可用显示器");
         return Err("未检测到可用显示器".into());
     }
     let image = if mode == "window" {
@@ -741,40 +758,77 @@ fn capture_start_with_state<R: tauri::Runtime>(
             .unwrap_or(&monitors[0]);
         primary
             .capture_image()
-            .map_err(|_| "无法捕获屏幕。请确认 dudu 已获得屏幕录制权限".to_string())?
+            .map_err(|e| {
+                log_error!("capture", "主屏幕捕获失败: {}", e);
+                "无法捕获屏幕。请确认 dudu 已获得屏幕录制权限".to_string()
+            })?
     };
+    let cap_ms = t_start.elapsed().as_millis();
     let width = image.width();
     let height = image.height();
+    log_info!("capture", "底图截取成功: {}x{}，耗时: {}ms", width, height, cap_ms);
+
     *state.capture.write().map_err(err)? = Some(image.clone());
-    let bytes = encode_png(&image)?;
+
+    let t_enc = std::time::Instant::now();
+    let bytes = encode_screen_preview(&image)?;
+    let enc_ms = t_enc.elapsed().as_millis();
+    let size_kb = bytes.len() / 1024;
+    log_info!("capture", "交互背板无损编码完成，耗时: {}ms, 大小: {}KB", enc_ms, size_kb);
+
     let cap = Capture {
         data: format!("data:image/png;base64,{}", BASE64.encode(bytes)),
         width,
         height,
     };
     *state.capture_cache.write().map_err(err)? = Some(cap.clone());
-    let _ = app.emit("capture-ready", cap);
-    let url = WebviewUrl::App(format!("index.html?overlay={mode}").into());
+    let _ = app.emit("capture-ready", cap.clone());
+
     if let Some(existing) = app.get_webview_window("capture") {
-        let _ = existing.close();
+        log_info!("capture", "复用现有截图窗口，立即显示并重聚焦点");
+        let _ = existing.show();
+        let _ = existing.unminimize();
+        let _ = existing.set_focus();
+        let _ = existing.emit("capture-ready", cap);
+    } else {
+        log_info!("capture", "创建全新全屏截图窗口");
+        let url = WebviewUrl::App(format!("index.html?overlay={mode}").into());
+        let builder = WebviewWindowBuilder::new(app, "capture", url)
+            .title("dudu 截图工作台")
+            .decorations(false)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .fullscreen(true);
+        let win = builder.build().map_err(|e| {
+            log_error!("capture", "创建截图窗口失败: {}", e);
+            e.to_string()
+        })?;
+        let _ = win.set_focus();
     }
-    let builder = WebviewWindowBuilder::new(app, "capture", url)
-        .title("dudu 截图工作台")
-        .decorations(false)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .fullscreen(true);
-    let win = builder.build().map_err(err)?;
-    let _ = win.set_focus();
     Ok(())
 }
 
-fn encode_png(image: &RgbaImage) -> Result<Vec<u8>> {
+fn encode_screen_preview(image: &RgbaImage) -> Result<Vec<u8>> {
+    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+    use image::ImageEncoder;
     let mut bytes = Cursor::new(Vec::new());
-    DynamicImage::ImageRgba8(image.clone())
-        .write_to(&mut bytes, ImageFormat::Png)
-        .map_err(err)?;
+    let encoder = PngEncoder::new_with_quality(&mut bytes, CompressionType::Fast, FilterType::NoFilter);
+    if let Err(_) = encoder.write_image(
+        image.as_raw(),
+        image.width(),
+        image.height(),
+        image::ExtendedColorType::Rgba8,
+    ) {
+        bytes = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(image.clone())
+            .write_to(&mut bytes, ImageFormat::Png)
+            .map_err(err)?;
+    }
     Ok(bytes.into_inner())
+}
+
+fn encode_png(image: &RgbaImage) -> Result<Vec<u8>> {
+    encode_screen_preview(image)
 }
 
 fn decode_data(input: &str, limit: usize) -> Result<Vec<u8>> {
@@ -802,7 +856,7 @@ fn pending_capture(state: tauri::State<'_, AppState>) -> Result<Capture> {
     let width = image.width();
     let height = image.height();
     let cap = Capture {
-        data: format!("data:image/png;base64,{}", BASE64.encode(encode_png(&image)?)),
+        data: format!("data:image/png;base64,{}", BASE64.encode(encode_screen_preview(&image)?)),
         width,
         height,
     };
@@ -898,7 +952,6 @@ fn capture_output(
     }
     if let Some(w) = app.get_webview_window("capture") {
         let _ = w.hide();
-        let _ = w.destroy();
     }
     Ok(())
 }
@@ -939,17 +992,43 @@ fn capture_color(app: tauri::AppHandle, color: String) -> Result<()> {
     let _ = app.emit("color", color);
     if let Some(w) = app.get_webview_window("capture") {
         let _ = w.hide();
-        let _ = w.destroy();
     }
     Ok(())
 }
 
 #[tauri::command]
 fn cancel_capture(app: tauri::AppHandle) -> Result<()> {
+    log_info!("capture", "用户取消/退出截图工作台");
     if let Some(w) = app.get_webview_window("capture") {
         let _ = w.hide();
-        let _ = w.destroy();
     }
+    Ok(())
+}
+
+#[tauri::command]
+fn get_debug_log_path() -> Result<String> {
+    Ok(logger::get_primary_log_file().to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn get_recent_logs(lines: Option<usize>) -> Result<String> {
+    logger::read_recent_logs(lines.unwrap_or(100)).map_err(err)
+}
+
+#[tauri::command]
+fn clear_debug_log() -> Result<()> {
+    logger::clear_logs().map_err(err)
+}
+
+#[tauri::command]
+fn open_log_folder() -> Result<()> {
+    let dir = logger::get_log_dir();
+    open::that(dir).map_err(err)
+}
+
+#[tauri::command]
+fn frontend_log(level: String, tag: String, message: String) -> Result<()> {
+    logger::log_raw(&level, &tag, &message);
     Ok(())
 }
 
@@ -1053,27 +1132,34 @@ fn open_image(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Resul
     let width = img.width();
     let height = img.height();
     *state.capture.write().map_err(err)? = Some(img.clone());
-    let bytes = encode_png(&img)?;
-    let url = WebviewUrl::App("index.html?overlay=image".into());
+    let bytes = encode_screen_preview(&img)?;
+    let cap = Capture {
+        data: format!("data:image/png;base64,{}", BASE64.encode(bytes)),
+        width,
+        height,
+    };
+    *state.capture_cache.write().map_err(err)? = Some(cap.clone());
     if let Some(main) = app.get_webview_window("main") {
         let _ = main.hide();
     }
-    WebviewWindowBuilder::new(&app, "capture", url)
-        .title("dudu 截图工作台")
-        .decorations(false)
-        .always_on_top(true)
-        .inner_size(width.min(1200) as f64, height.min(850) as f64)
-        .center()
-        .build()
-        .map_err(err)?;
-    let _ = app.emit(
-        "capture-ready",
-        Capture {
-            data: format!("data:image/png;base64,{}", BASE64.encode(bytes)),
-            width,
-            height,
-        },
-    );
+    if let Some(existing) = app.get_webview_window("capture") {
+        let _ = existing.show();
+        let _ = existing.unminimize();
+        let _ = existing.set_focus();
+        let _ = existing.emit("capture-ready", cap.clone());
+    } else {
+        let url = WebviewUrl::App("index.html?overlay=image".into());
+        let win = WebviewWindowBuilder::new(&app, "capture", url)
+            .title("dudu 截图工作台")
+            .decorations(false)
+            .always_on_top(true)
+            .inner_size(width.min(1200) as f64, height.min(850) as f64)
+            .center()
+            .build()
+            .map_err(err)?;
+        let _ = win.set_focus();
+    }
+    let _ = app.emit("capture-ready", cap);
     Ok(())
 }
 
@@ -1585,6 +1671,7 @@ pub fn run() {
         ))
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .setup(|app| {
+            logger::init_logger();
             let base = app
                 .path()
                 .app_data_dir()
@@ -1649,7 +1736,12 @@ pub fn run() {
             quit_app,
             open_project,
             open_releases,
-            open_external
+            open_external,
+            get_debug_log_path,
+            get_recent_logs,
+            clear_debug_log,
+            open_log_folder,
+            frontend_log
         ])
         .on_window_event(|window, event| {
             if window.label() == "main" {

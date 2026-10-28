@@ -70,7 +70,7 @@ export default function App() {
     ready: false,
     error: '',
     shortcutErrors: [],
-    version: '0.1.5',
+    version: '0.1.6',
     platform: '',
   });
   const [toast, setToast] = useState('');
@@ -93,6 +93,7 @@ export default function App() {
   const [windows, setWindows] = useState<{ id: number; title: string }[]>([]);
   const [colors, setColors] = useState<string[]>([]);
   const [serialSeparator, setSerialSeparator] = useState('\n');
+  const [logPreview, setLogPreview] = useState('');
 
   const serial = useRef(0);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -272,11 +273,6 @@ export default function App() {
     }
     return null;
   }, [source]);
-
-  const route = new URLSearchParams(location.search);
-  if (route.has('quick-translate')) return <QuickTranslate />;
-  if (route.has('overlay')) return <CaptureEditor mode={route.get('overlay')!} />;
-  if (route.has('pin')) return <CaptureEditor mode="pin" />;
 
   return (
     <div className="app-shell">
@@ -1278,6 +1274,72 @@ export default function App() {
                 <p className="setting-hint">
                   快捷键支持形如 Ctrl+Alt+A 或 Super+Shift+A。若按键被系统或其他第三方软件占用，保存时会明确提示冲突项。
                 </p>
+              </section>
+
+              <section className="settings-section">
+                <div className="section-heading">
+                  <h2>
+                    <FileText size={18} /> 运行与调试日志
+                  </h2>
+                </div>
+                <p className="setting-hint" style={{ marginTop: 0 }}>
+                  软件在后台运行，所有快捷键触发、截图捕获、文字识别与报错信息均持久化记录在本地日志文件中。若遇到卡顿或异常，可随时一键打开目录或复制日志内容排查。
+                </p>
+                <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', margin: '14px 0' }}>
+                  <button className="primary" onClick={() => void run(() => call('open_log_folder'), '已打开日志所在目录')}>
+                    <ExternalLink size={15} /> 打开日志存储目录
+                  </button>
+                  <button className="secondary" onClick={async () => {
+                    try {
+                      const logs = await call<string>('get_recent_logs', { lines: 150 });
+                      await call('write_text', { text: logs });
+                      notify('已将最近 150 行运行日志复制到剪贴板');
+                    } catch (e) {
+                      notify('复制日志失败：' + (e as Error).message);
+                    }
+                  }}>
+                    <Copy size={15} /> 复制最近日志到剪贴板
+                  </button>
+                  <button className="secondary" onClick={async () => {
+                    try {
+                      await call('clear_debug_log');
+                      setLogPreview('');
+                      notify('调试日志已清空');
+                    } catch (e) {
+                      notify('清空日志失败：' + (e as Error).message);
+                    }
+                  }}>
+                    <Trash2 size={15} /> 清空调试日志
+                  </button>
+                  <button className="secondary" onClick={async () => {
+                    try {
+                      const logs = await call<string>('get_recent_logs', { lines: 50 });
+                      setLogPreview(logs);
+                    } catch (e) {
+                      notify('载入日志失败');
+                    }
+                  }}>
+                    <RefreshCw size={15} /> 刷新日志预览
+                  </button>
+                </div>
+                {logPreview && (
+                  <pre
+                    style={{
+                      background: '#161a1d',
+                      color: '#68d391',
+                      padding: 12,
+                      borderRadius: 8,
+                      fontSize: 11,
+                      fontFamily: 'Consolas, monospace',
+                      maxHeight: 220,
+                      overflowY: 'auto',
+                      whiteSpace: 'pre-wrap',
+                      wordBreak: 'break-all',
+                    }}
+                  >
+                    {logPreview}
+                  </pre>
+                )}
               </section>
             </>
           )}

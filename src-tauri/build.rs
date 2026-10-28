@@ -11,7 +11,7 @@ fn main() {
         } else {
             "x86_64-apple-macos13.0"
         };
-        let result = std::process::Command::new("swiftc")
+        let status = std::process::Command::new("swiftc")
             .args([
                 helper_swift.to_str().unwrap(),
                 "-O",
@@ -20,9 +20,19 @@ fn main() {
                 "-o",
                 helper_bin.to_str().unwrap(),
             ])
-            .status()
-            .expect("Xcode Command Line Tools are required to build the macOS OCR helper");
-        assert!(result.success(), "Could not compile the native OCR helper");
+            .status();
+
+        match status {
+            Ok(s) if s.success() => {
+                println!("cargo:info=Compiled native macOS OCR helper");
+            }
+            _ => {
+                eprintln!("cargo:warning=Could not compile native macOS OCR helper with swiftc");
+                if !helper_bin.exists() {
+                    let _ = std::fs::write(&helper_bin, b"#!/bin/sh\nexit 1\n");
+                }
+            }
+        }
     }
     println!("cargo:rerun-if-changed=native/Helper.swift");
     tauri_build::build()

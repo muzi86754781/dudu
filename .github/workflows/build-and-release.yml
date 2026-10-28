@@ -105,3 +105,4 @@ jobs:
             src-tauri/target/release/bundle/dmg/*.dmg
             src-tauri/target/*/release/bundle/dmg/*.dmg
           if-no-files-found: warn
+

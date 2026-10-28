@@ -5,7 +5,7 @@ mod store;
 
 use arboard::Clipboard;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use enigo::{Axis, Direction, Enigo, Key, Keyboard, Mouse, Settings as InputSettings};
+use enigo::{Axis, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings as InputSettings};
 use image::{DynamicImage, GenericImageView, ImageFormat, ImageReader, RgbaImage};
 use model::{err, now, Capture, Clip, Result, Settings, Status, Translation};
 use serde::Deserialize;
@@ -1044,7 +1044,7 @@ fn set_long_capture_mode(
             .iter()
             .find(|m| m.is_primary().unwrap_or(false))
             .unwrap_or(&monitors[0]);
-        let screen_w = primary.width() as f64;
+        let screen_w = primary.width().map_err(err)? as f64;
 
         let hud_w = 380.0;
         let hud_h = 720.0;
@@ -1113,7 +1113,7 @@ fn scroll_and_capture_slice(
         let mut e = Enigo::new(&InputSettings::default()).map_err(err)?;
         let center_x = (x + width / 2) as i32;
         let center_y = (y + height / 2) as i32;
-        let _ = e.move_location(center_x, center_y, enigo::Coordinate::Abs);
+        let _ = e.move_mouse(center_x, center_y, Coordinate::Abs);
         let _ = e.scroll(delta, Axis::Vertical);
         std::thread::sleep(std::time::Duration::from_millis(180));
     }

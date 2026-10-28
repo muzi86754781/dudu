@@ -18,7 +18,7 @@ use tauri::{
     image::Image as TauriImage,
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindowBuilder,
+    Emitter, Manager, WebviewUrl, WebviewWindowBuilder,
 };
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
@@ -90,19 +90,16 @@ fn register_shortcuts<R: tauri::Runtime>(
                     });
                 }
                 "translate" => {
-                    let _ = app_clone.emit("navigate", "translate");
-                    let _ = show_main(&app_clone);
+                    let a = app_clone.clone();
+                    std::thread::spawn(move || {
+                        let _ = show_quick_translate(&a, None);
+                    });
                 }
                 "selection" => {
                     let a = app_clone.clone();
-                    std::thread::spawn(move || match selected_text() {
-                        Ok(t) => {
-                            let _ = a.emit("selected-text", t);
-                            let _ = show_main(&a);
-                        }
-                        Err(e) => {
-                            let _ = a.emit("error", e);
-                        }
+                    std::thread::spawn(move || {
+                        let text = selected_text().ok();
+                        let _ = show_quick_translate(&a, text);
                     });
                 }
                 _ => {}
@@ -121,6 +118,63 @@ fn show_main<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<()> {
     w.set_focus().map_err(err)
 }
 
+fn show_quick_translate<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    initial_text: Option<String>,
+) -> Result<()> {
+    if let Some(w) = app.get_webview_window("quick-translate") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+        if let Some(text) = initial_text {
+            let _ = w.emit("quick-translate-text", text);
+        }
+        return Ok(());
+    }
+    let url = WebviewUrl::App("index.html?quick-translate=1".into());
+    let w = WebviewWindowBuilder::new(app, "quick-translate", url)
+        .title("dudu 翻译")
+        .decorations(false)
+        .transparent(true)
+        .always_on_top(true)
+        .inner_size(440.0, 310.0)
+        .center()
+        .skip_taskbar(true)
+        .build()
+        .map_err(err)?;
+    let _ = w.set_focus();
+    if let Some(text) = initial_text {
+        let w_clone = w.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let _ = w_clone.emit("quick-translate-text", text);
+        });
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn hide_quick_translate(app: tauri::AppHandle) -> Result<()> {
+    if let Some(w) = app.get_webview_window("quick-translate") {
+        let _ = w.hide();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn set_quick_translate_pin(app: tauri::AppHandle, pinned: bool) -> Result<()> {
+    if let Some(w) = app.get_webview_window("quick-translate") {
+        let _ = w.set_always_on_top(pinned);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn open_settings_window(app: tauri::AppHandle) -> Result<()> {
+    show_main(&app)?;
+    app.emit("navigate", "settings").map_err(err)
+}
+
 #[tauri::command]
 fn save_settings(
     app: tauri::AppHandle,
@@ -134,6 +188,7 @@ fn save_settings(
         app.autolaunch().disable().map_err(err)?
     }
     let errors = register_shortcuts(&app, &settings);
+    let _ = refresh_tray(&app, &settings);
     Ok(Status {
         ready: true,
         error: String::new(),
@@ -700,16 +755,6 @@ fn capture_start_with_state<R: tauri::Runtime>(
         },
     )
     .map_err(err)?;
-    let scale = monitors
-        .first()
-        .and_then(|m| m.scale_factor().ok())
-        .unwrap_or(1.0)
-        .max(1.0);
-    let pos = monitors
-        .first()
-        .map(|m| PhysicalPosition::new(m.x().unwrap_or(0), m.y().unwrap_or(0)))
-        .unwrap_or_default();
-    let dims = PhysicalSize::new(width, height);
     let url = WebviewUrl::App(format!("index.html?overlay={mode}").into());
     if let Some(existing) = app.get_webview_window("capture") {
         let _ = existing.close();
@@ -719,9 +764,10 @@ fn capture_start_with_state<R: tauri::Runtime>(
         .decorations(false)
         .always_on_top(true)
         .skip_taskbar(true)
-        .position(pos.x as f64 / scale as f64, pos.y as f64 / scale as f64)
-        .inner_size(dims.width as f64 / scale as f64, dims.height as f64 / scale as f64);
-    builder.build().map_err(err)?;
+        .transparent(true)
+        .fullscreen(true);
+    let win = builder.build().map_err(err)?;
+    let _ = win.set_focus();
     Ok(())
 }
 
@@ -845,7 +891,6 @@ fn capture_output(
         if let Some(w) = app.get_webview_window("capture") {
             let _ = w.close();
         }
-        let _ = show_main(&app);
     }
     Ok(())
 }
@@ -885,15 +930,15 @@ fn capture_color(app: tauri::AppHandle, color: String) -> Result<()> {
     if let Some(w) = app.get_webview_window("capture") {
         let _ = w.close();
     }
-    show_main(&app)
+    Ok(())
 }
 
 #[tauri::command]
 fn cancel_capture(app: tauri::AppHandle) -> Result<()> {
     if let Some(w) = app.get_webview_window("capture") {
-        w.close().map_err(err)?
+        let _ = w.close().map_err(err)?;
     }
-    show_main(&app)
+    Ok(())
 }
 
 #[tauri::command]
@@ -1173,14 +1218,10 @@ fn start_listener(app: tauri::AppHandle, db_path: PathBuf) {
             let mut last_text = String::new();
             let mut last_image = String::new();
             loop {
-                std::thread::sleep(std::time::Duration::from_millis(800));
+                std::thread::sleep(std::time::Duration::from_millis(600));
                 let Some(state) = app.try_state::<AppState>() else { break };
                 let Ok(settings) = state.settings() else { continue };
-                if !settings.permits("ready", "") {
-                    continue;
-                }
-                let source = foreground_app();
-                if source.is_empty() || !settings.permits(&source, "") {
+                if settings.paused || !settings.consent {
                     continue;
                 }
                 if let Ok(text) = clipboard.get_text() {
@@ -1188,8 +1229,12 @@ fn start_listener(app: tauri::AppHandle, db_path: PathBuf) {
                     if !text.trim().is_empty()
                         && text.len() <= 128 * 1024
                         && text != last_text
-                        && settings.permits(&source, &text)
                     {
+                        let source = foreground_app();
+                        if !settings.permits(&source, &text) {
+                            last_text = text;
+                            continue;
+                        }
                         let c = Clip {
                             id: uuid::Uuid::new_v4().to_string(),
                             kind: "text".into(),
@@ -1224,6 +1269,11 @@ fn start_listener(app: tauri::AppHandle, db_path: PathBuf) {
                             && img.width.saturating_mul(img.height) <= 40_000_000
                             && img.bytes.len() <= 20 * 1024 * 1024
                         {
+                            let source = foreground_app();
+                            if !settings.permits(&source, "") {
+                                last_image = hash;
+                                continue;
+                            }
                             let rgba = match RgbaImage::from_raw(
                                 img.width as u32,
                                 img.height as u32,
@@ -1274,9 +1324,14 @@ fn start_listener(app: tauri::AppHandle, db_path: PathBuf) {
 #[cfg(windows)]
 fn foreground_app() -> String {
     use windows::Win32::{
-        System::Threading::GetCurrentProcessId,
+        Foundation::CloseHandle,
+        System::Threading::{
+            GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW,
+            PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
+        },
         UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId},
     };
+
     let hwnd = unsafe { GetForegroundWindow() };
     if hwnd.0.is_null() {
         return String::new();
@@ -1285,29 +1340,35 @@ fn foreground_app() -> String {
     unsafe {
         GetWindowThreadProcessId(hwnd, Some(&mut pid));
     }
-    if pid == unsafe { GetCurrentProcessId() } {
+    if pid == 0 || pid == unsafe { GetCurrentProcessId() } {
         return String::new();
     }
-    xcap::Window::all()
-        .ok()
-        .and_then(|w| {
-            w.into_iter()
-                .find(|w| w.is_focused().unwrap_or(false))
-                .and_then(|w| w.app_name().ok())
-        })
-        .unwrap_or_default()
+    let Ok(process) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else {
+        return String::new();
+    };
+    let mut path_buf = [0u16; 1024];
+    let mut len = path_buf.len() as u32;
+    let res = unsafe {
+        QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_FORMAT(0),
+            windows::core::PWSTR(path_buf.as_mut_ptr()),
+            &mut len,
+        )
+    };
+    let _ = unsafe { CloseHandle(process) };
+    if res.is_ok() && len > 0 {
+        let full_path = String::from_utf16_lossy(&path_buf[..len as usize]);
+        if let Some(file_name) = std::path::Path::new(&full_path).file_name() {
+            return file_name.to_string_lossy().to_string();
+        }
+    }
+    String::new()
 }
 
 #[cfg(target_os = "macos")]
 fn foreground_app() -> String {
-    xcap::Window::all()
-        .ok()
-        .and_then(|w| {
-            w.into_iter()
-                .find(|w| w.is_focused().unwrap_or(false))
-                .and_then(|w| w.app_name().ok())
-        })
-        .unwrap_or_default()
+    String::new()
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
@@ -1315,34 +1376,133 @@ fn foreground_app() -> String {
     String::new()
 }
 
-fn build_tray<R: tauri::Runtime>(app: &tauri::App<R>) -> tauri::Result<()> {
-    let open = MenuItem::with_id(app, "open", "打开 dudu", true, None::<&str>)?;
-    let pause = MenuItem::with_id(app, "pause", "暂停剪贴板记录", true, None::<&str>)?;
-    let separator = PredefinedMenuItem::separator(app)?;
-    let quit = MenuItem::with_id(app, "quit", "退出 dudu", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open, &pause, &separator, &quit])?;
+fn create_tray_menu<M: tauri::Manager<R>, R: tauri::Runtime>(
+    manager: &M,
+    settings: &Settings,
+) -> tauri::Result<Menu<R>> {
+    let get_sc = |k: &str| -> String {
+        settings.shortcuts.get(k).cloned().unwrap_or_default()
+    };
+
+    let sc_region = get_sc("region");
+    let sc_window = get_sc("window");
+    let sc_fullscreen = get_sc("fullscreen");
+    let sc_color = get_sc("color");
+    let sc_translate = get_sc("translate");
+    let sc_selection = get_sc("selection");
+    let sc_clipboard = get_sc("clipboard");
+
+    let title_region = if sc_region.is_empty() { "区域截图".into() } else { format!("区域截图 ({})", sc_region) };
+    let title_window = if sc_window.is_empty() { "窗口截图".into() } else { format!("窗口截图 ({})", sc_window) };
+    let title_fullscreen = if sc_fullscreen.is_empty() { "全屏截图".into() } else { format!("全屏截图 ({})", sc_fullscreen) };
+    let title_color = if sc_color.is_empty() { "屏幕取色".into() } else { format!("屏幕取色 ({})", sc_color) };
+    let title_translate = if sc_translate.is_empty() { "输入翻译".into() } else { format!("输入翻译 ({})", sc_translate) };
+    let title_selection = if sc_selection.is_empty() { "划词翻译".into() } else { format!("划词翻译 ({})", sc_selection) };
+    let title_clipboard = if sc_clipboard.is_empty() { "剪贴板历史".into() } else { format!("剪贴板历史 ({})", sc_clipboard) };
+    let title_pause = if settings.paused { "继续剪贴板记录" } else { "暂停剪贴板记录" };
+
+    let item_region = MenuItem::with_id(manager, "region", title_region, true, None::<&str>)?;
+    let item_window = MenuItem::with_id(manager, "window", title_window, true, None::<&str>)?;
+    let item_fullscreen = MenuItem::with_id(manager, "fullscreen", title_fullscreen, true, None::<&str>)?;
+    let item_color = MenuItem::with_id(manager, "color", title_color, true, None::<&str>)?;
+    let sep1 = PredefinedMenuItem::separator(manager)?;
+    let item_translate = MenuItem::with_id(manager, "translate", title_translate, true, None::<&str>)?;
+    let item_selection = MenuItem::with_id(manager, "selection", title_selection, true, None::<&str>)?;
+    let item_clipboard = MenuItem::with_id(manager, "clipboard", title_clipboard, true, None::<&str>)?;
+    let sep2 = PredefinedMenuItem::separator(manager)?;
+    let item_settings = MenuItem::with_id(manager, "settings", "偏好设置", true, None::<&str>)?;
+    let item_pause = MenuItem::with_id(manager, "pause", title_pause, true, None::<&str>)?;
+    let sep3 = PredefinedMenuItem::separator(manager)?;
+    let item_quit = MenuItem::with_id(manager, "quit", "退出 dudu", true, None::<&str>)?;
+
+    Menu::with_items(
+        manager,
+        &[
+            &item_region,
+            &item_window,
+            &item_fullscreen,
+            &item_color,
+            &sep1,
+            &item_translate,
+            &item_selection,
+            &item_clipboard,
+            &sep2,
+            &item_settings,
+            &item_pause,
+            &sep3,
+            &item_quit,
+        ],
+    )
+}
+
+fn refresh_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>, settings: &Settings) -> Result<()> {
+    if let Some(tray) = app.tray_by_id("main") {
+        if let Ok(menu) = create_tray_menu(app, settings) {
+            let _ = tray.set_menu(Some(menu));
+        }
+    }
+    Ok(())
+}
+
+fn build_tray<R: tauri::Runtime>(app: &tauri::App<R>, settings: &Settings) -> tauri::Result<()> {
+    let menu = create_tray_menu(app, settings)?;
     let icon = TauriImage::from_bytes(include_bytes!("../icons/32x32.png"))?;
-    TrayIconBuilder::new()
+    TrayIconBuilder::with_id("main")
         .icon(icon)
         .tooltip("dudu · 桌面效率工作台")
         .menu(&menu)
         .on_menu_event(|app, event| match event.id().as_ref() {
-            "open" => {
+            "region" => {
+                let a = app.clone();
+                std::thread::spawn(move || {
+                    let _ = capture_start(&a, "region", 0, None);
+                });
+            }
+            "window" => {
+                let a = app.clone();
+                std::thread::spawn(move || {
+                    let _ = capture_start(&a, "window", 0, None);
+                });
+            }
+            "fullscreen" => {
+                let a = app.clone();
+                std::thread::spawn(move || {
+                    let _ = capture_start(&a, "fullscreen", 0, None);
+                });
+            }
+            "color" => {
+                let a = app.clone();
+                std::thread::spawn(move || {
+                    let _ = capture_start(&a, "color", 0, None);
+                });
+            }
+            "translate" => {
+                let a = app.clone();
+                std::thread::spawn(move || {
+                    let _ = show_quick_translate(&a, None);
+                });
+            }
+            "selection" => {
+                let a = app.clone();
+                std::thread::spawn(move || {
+                    let text = selected_text().ok();
+                    let _ = show_quick_translate(&a, text);
+                });
+            }
+            "clipboard" => {
+                let _ = app.emit("navigate", "clipboard");
+                let _ = show_main(app);
+            }
+            "settings" => {
+                let _ = app.emit("navigate", "settings");
                 let _ = show_main(app);
             }
             "pause" => {
                 let state = app.state::<AppState>();
                 if let Ok(mut s) = state.settings() {
                     s.paused = !s.paused;
-                    let label = if s.paused {
-                        "继续剪贴板记录"
-                    } else {
-                        "暂停剪贴板记录"
-                    };
-                    let _ = state.save(s);
-                    if let Some(tray) = app.tray_by_id("main") {
-                        let _ = tray.set_tooltip(Some(format!("dudu · {label}")));
-                    }
+                    let _ = state.save(s.clone());
+                    let _ = refresh_tray(app, &s);
                 }
             }
             "quit" => app.exit(0),
@@ -1391,7 +1551,7 @@ pub fn run() {
                 data_dir: base.clone(),
             });
             let icon_errors = register_shortcuts(app.handle(), &settings);
-            let _ = build_tray(app);
+            let _ = build_tray(app, &settings);
             if !icon_errors.is_empty() {
                 let _ = app.emit(
                     "error",
@@ -1415,6 +1575,9 @@ pub fn run() {
             write_text,
             translation_history,
             translate,
+            hide_quick_translate,
+            set_quick_translate_pin,
+            open_settings_window,
             start_capture,
             pending_capture,
             capture_output,

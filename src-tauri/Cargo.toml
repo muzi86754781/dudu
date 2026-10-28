@@ -1,6 +1,6 @@
 [package]
 name = "dudu"
-version = "0.1.0"
+version = "0.1.1"
 description = "Local-first capture, translation and clipboard workspace"
 authors = ["dudu contributors"]
 edition = "2021"
@@ -38,7 +38,7 @@ enigo = "0.3"
 open = "5"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.61", features = ["Media_Ocr", "Graphics_Imaging", "Storage_Streams", "Globalization", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading"] }
+windows = { version = "0.61", features = ["Media_Ocr", "Graphics_Imaging", "Storage_Streams", "Globalization", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Win32_Foundation"] }
 
 [profile.release]
 codegen-units = 1

@@ -53,6 +53,7 @@ import {
   type DictEntry,
 } from './model';
 import CaptureEditor from './CaptureEditor';
+import QuickTranslate from './QuickTranslate';
 
 const nav = [
   ['clipboard', Clipboard, '剪贴板'],
@@ -69,7 +70,7 @@ export default function App() {
     ready: false,
     error: '',
     shortcutErrors: [],
-    version: '0.1.0',
+    version: '0.1.1',
     platform: '',
   });
   const [toast, setToast] = useState('');
@@ -273,6 +274,7 @@ export default function App() {
   }, [source]);
 
   const route = new URLSearchParams(location.search);
+  if (route.has('quick-translate')) return <QuickTranslate />;
   if (route.has('overlay')) return <CaptureEditor mode={route.get('overlay')!} />;
   if (route.has('pin')) return <CaptureEditor mode="pin" />;
 

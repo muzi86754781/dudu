@@ -366,7 +366,6 @@ export default function CaptureEditor({ mode }: { mode: string }) {
       <div
         className="screen-selection"
         ref={selection}
-        style={{ backgroundImage: `url(${capture.data})` }}
         onContextMenu={e => {
           e.preventDefault();
           void call('cancel_capture');
@@ -409,6 +408,12 @@ export default function CaptureEditor({ mode }: { mode: string }) {
           setEnd(null);
         }}
       >
+        <img
+          src={capture.data}
+          alt="screen"
+          className="selection-background-img"
+          draggable={false}
+        />
         <div className="selection-instructions">
           {mode === 'color' ? '移动光标实时取色 · 点击复制 HEX' : '拖动选择截图区域 · 双击全选'}
           <span>Esc 或右键取消</span>

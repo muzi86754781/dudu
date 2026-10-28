@@ -1,2 +1,31 @@
 <!doctype html>
-<html lang="zh-CN"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><meta name="theme-color" content="#f6f7f3"/><title>dudu · 桌面效率工作台</title></head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <meta name="theme-color" content="#f6f7f3"/>
+    <title>dudu · 桌面效率工作台</title>
+    <style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        background: transparent;
+      }
+      body:not(.window-transparent) {
+        background-color: #f6f7f3;
+      }
+    </style>
+    <script>
+      (function() {
+        if (location.search.includes('overlay=') || location.search.includes('pin=') || location.search.includes('quick-translate=')) {
+          document.documentElement.style.background = 'transparent';
+          document.body.classList.add('window-transparent');
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

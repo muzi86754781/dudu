@@ -64,3 +64,27 @@ describe('developer identifier conversions and dictionary', () => {
     expect(hexToRgb('#FF0080')).toEqual({ r: 255, g: 0, b: 128 });
   });
 });
+
+describe('legacy settings compat (serde round-trip guard)', () => {
+  // 死开关已从设置页 UI 移除，但 Rust Settings 结构体仍消费这些字段，
+  // 前端 defaults 必须继续携带，否则 Rust 反序列化走默认路径时行为漂移。
+  it('keeps the 5 retired switch fields in defaults', () => {
+    const d = defaults as unknown as Record<string, unknown>;
+    for (const k of ['saveFormat', 'autoCopy', 'silentOcr', 'silentTranslate', 'clipboardTranslate']) {
+      expect(d[k]).not.toBeUndefined();
+    }
+  });
+});
+
+describe('configuration boundary values', () => {
+  it('accepts limit/timeout at exact edges and rejects one step outside', () => {
+    expect(validateSettings({ ...defaults, limit: 100 })).toBe('');
+    expect(validateSettings({ ...defaults, limit: 5000 })).toBe('');
+    expect(validateSettings({ ...defaults, limit: 99 })).toContain('历史');
+    expect(validateSettings({ ...defaults, limit: 5001 })).toContain('历史');
+    expect(validateSettings({ ...defaults, timeout: 3 })).toBe('');
+    expect(validateSettings({ ...defaults, timeout: 60 })).toBe('');
+    expect(validateSettings({ ...defaults, timeout: 2 })).toContain('超时');
+    expect(validateSettings({ ...defaults, timeout: 61 })).toContain('超时');
+  });
+});

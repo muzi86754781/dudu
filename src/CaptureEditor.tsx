@@ -295,8 +295,8 @@ function CaptureScreen({ mode }: { mode: string }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
   const loupeCanvasRef = useRef<HTMLCanvasElement>(null);
-  const probeCanvasRef = useRef<HTMLCanvasElement>(null);
-  const longCanvasRef = useRef<HTMLCanvasElement>(null);
+  const probeCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const longCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const inlineInputRef = useRef<HTMLInputElement>(null);
   const autoScrollTimer = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -523,7 +523,7 @@ function CaptureScreen({ mode }: { mode: string }) {
     ctx.beginPath();
     ctx.moveTo(centerStart + cellSize / 2, 0);
     ctx.lineTo(centerStart + cellSize / 2, centerStart);
-    ctx.moveTo(centerStart + cellSize / 2, centerStart + cellSize / 2);
+    ctx.moveTo(centerStart + cellSize / 2, centerStart + cellSize);
     ctx.lineTo(centerStart + cellSize / 2, loupe.height);
     ctx.stroke();
 

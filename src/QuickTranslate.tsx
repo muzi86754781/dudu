@@ -249,7 +249,18 @@ export default function QuickTranslate() {
   return (
     <div className="quick-translate-window">
       {/* Top Header Bar (Draggable) */}
-      <header className="quick-header" data-tauri-drag-region>
+      <header
+        className="quick-header"
+        data-tauri-drag-region
+        onMouseDown={e => {
+          // macOS WKWebView 下 data-tauri-drag-region 不生效，改用命令拖拽；
+          // 按钮区不触发拖拽，避免与置顶/关闭/菜单冲突。
+          if (e.button !== 0) return;
+          const t = e.target as HTMLElement;
+          if (t.closest('button')) return;
+          if (desktop) void call('start_window_drag');
+        }}
+      >
         <button
           className={`quick-icon-btn pin-btn ${pinned ? 'active' : ''}`}
           onClick={togglePin}

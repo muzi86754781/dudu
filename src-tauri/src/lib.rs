@@ -43,7 +43,6 @@ fn clipboard_status_payload() -> ClipboardStatus {
     }
 }
 
-
 #[tauri::command]
 fn clipboard_status() -> ClipboardStatus {
     clipboard_status_payload()
@@ -463,26 +462,6 @@ fn translation_history(state: tauri::State<'_, AppState>) -> Result<Vec<Translat
 }
 
 #[tauri::command]
-/// 目标语言智能配对（v0.1.9 中英互配）：
-/// 中文文本（含汉字且无日文假名）→ 英文；日文（含假名）与其他语言 → 简体中文。
-fn smart_target(text: &str) -> &'static str {
-    let mut cjk = 0u32;
-    let mut kana = 0u32;
-    for c in text.chars() {
-        let cp = c as u32;
-        if (0x4E00..=0x9FFF).contains(&cp) || (0x3400..=0x4DBF).contains(&cp) {
-            cjk += 1;
-        } else if (0x3040..=0x30FF).contains(&cp) {
-            kana += 1;
-        }
-    }
-    if cjk > 0 && kana == 0 {
-        "en"
-    } else {
-        "zh-CN"
-    }
-}
-
 async fn translate(
     state: tauri::State<'_, AppState>,
     text: String,
@@ -495,7 +474,7 @@ async fn translate(
     }
     if !["auto", "zh-CN", "zh-TW", "en", "ja", "ko", "fr", "de", "es", "ru"]
         .contains(&from.as_str())
-        || !["auto", "zh-CN", "zh-TW", "en", "ja", "ko", "fr", "de", "es", "ru"]
+        || !["zh-CN", "zh-TW", "en", "ja", "ko", "fr", "de", "es", "ru"]
             .contains(&to.as_str())
     {
         return Err("暂不支持所选语言".into());
@@ -504,16 +483,10 @@ async fn translate(
         return Err("未知翻译引擎".into());
     }
     let config = state.settings()?;
-    // 目标语言智能配对：to == "auto" 时按输入文本自动决定目标语言
-    let effective_to = if to == "auto" {
-        smart_target(&text).to_string()
-    } else {
-        to.clone()
-    };
     let mut hash = Sha256::new();
     hash.update(&text);
     hash.update(&from);
-    hash.update(&effective_to);
+    hash.update(&to);
     hash.update(&engine);
     let id = format!("{:x}", hash.finalize());
     if let Some(mut cached) = state.db.lock().map_err(err)?.cached(&id)? {
@@ -525,24 +498,24 @@ async fn translate(
         .build()
         .map_err(err)?;
     let result = match engine.as_str() {
-        "google" => google_translate(&client, &text, &from, &effective_to).await?,
+        "google" => google_translate(&client, &text, &from, &to).await?,
         "deepl" => {
             if config.deepl_key.trim().is_empty() {
                 return Err("请先在偏好设置中填入 DeepL Free API Key".into());
             }
-            deepl_translate(&client, &text, &from, &effective_to, &config.deepl_key).await?
+            deepl_translate(&client, &text, &from, &to, &config.deepl_key).await?
         }
         "baidu" => {
             if config.baidu_id.trim().is_empty() || config.baidu_key.trim().is_empty() {
                 return Err("请先在偏好设置中填入百度 App ID 与密钥".into());
             }
-            baidu_translate(&client, &text, &from, &effective_to, &config.baidu_id, &config.baidu_key).await?
+            baidu_translate(&client, &text, &from, &to, &config.baidu_id, &config.baidu_key).await?
         }
         "youdao" => {
             if config.youdao_key.trim().is_empty() || config.youdao_secret.trim().is_empty() {
                 return Err("请先在偏好设置中填入有道智云 App Key 与应用密钥".into());
             }
-            youdao_translate(&client, &text, &from, &effective_to, &config.youdao_key, &config.youdao_secret).await?
+            youdao_translate(&client, &text, &from, &to, &config.youdao_key, &config.youdao_secret).await?
         }
         _ => unreachable!(),
     };
@@ -552,7 +525,7 @@ async fn translate(
         result,
         engine,
         from,
-        to: effective_to,
+        to,
         created: now(),
         cached: false,
     };
@@ -1047,7 +1020,7 @@ fn capture_output(
         "ocr" => {
             let text = ocr(&image)?;
             if text.trim().is_empty() {
-                return Err("未识别到文字，请换一块区域重试".into());
+                return Err("没有识别出文字，请选择文字清晰的区域".into());
             }
             Clipboard::new().map_err(err)?.set_text(text.clone()).map_err(err)?;
             let _ = app.emit("ocr-text", text);

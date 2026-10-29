@@ -130,6 +130,7 @@ function PinViewer() {
   const [capture, setCapture] = useState<Capture | null>(null);
   const [opacity, setOpacity] = useState(1);
   const [zoom, setZoom] = useState(1);
+  const [pinFailed, setPinFailed] = useState(false);
 
   useEffect(() => {
     let mounted = true;
@@ -159,6 +160,7 @@ function PinViewer() {
           tag: 'pin_ui',
           message: `PinViewer received pin-data event: ${c.width}x${c.height}`,
         });
+        setPinFailed(false);
         setCapture(c);
       }
     });
@@ -254,7 +256,17 @@ function PinViewer() {
             alt="置顶贴图"
             style={{ transform: `scale(${zoom})`, transformOrigin: 'center center' }}
             draggable={false}
+            onError={() => {
+              void call('frontend_log', {
+                level: 'ERROR',
+                tag: 'pin_ui',
+                message: '贴图图像解码失败（data 无效或过大）',
+              });
+              setPinFailed(true);
+            }}
           />
+        ) : pinFailed ? (
+          <span style={{ fontSize: 12, color: '#e66' }}>贴图加载失败</span>
         ) : (
           <span style={{ fontSize: 12, color: '#666' }}>正在准备贴图…</span>
         )}
@@ -402,6 +414,20 @@ function CaptureScreen({ mode }: { mode: string }) {
 
     const handleLoadedCapture = (c: Capture) => {
       if (cancelled) return;
+      // 每次新截图会话彻底复位：避免上个会话因操作挂起残留的 busy 带入本会话
+      setBusy(false);
+      setShapes([]);
+      setRedo([]);
+      setActiveTool(null);
+      if (!c || !c.data) {
+        void call('frontend_log', {
+          level: 'ERROR',
+          tag: 'capture_ui',
+          message: 'capture data empty',
+        });
+        showToast('截图数据为空，请重新截图');
+        return;
+      }
       void call('frontend_log', {
         level: 'INFO',
         tag: 'capture_ui',
@@ -413,9 +439,6 @@ function CaptureScreen({ mode }: { mode: string }) {
       } else {
         setCrop(null);
       }
-      setShapes([]);
-      setRedo([]);
-      setActiveTool(null);
 
       const img = new Image();
       img.onload = () => {
@@ -426,6 +449,16 @@ function CaptureScreen({ mode }: { mode: string }) {
           tag: 'capture_ui',
           message: 'Preview image decoded and ready in DOM',
         });
+      };
+      img.onerror = () => {
+        if (cancelled) return;
+        imageRef.current = null;
+        void call('frontend_log', {
+          level: 'ERROR',
+          tag: 'capture_ui',
+          message: '截图图像解码失败（data 无效或过大）',
+        });
+        showToast('截图图像解码失败，请重新截图');
       };
       img.src = c.data;
     };
@@ -557,6 +590,8 @@ function CaptureScreen({ mode }: { mode: string }) {
       return longCanvasRef.current.toDataURL('image/png');
     }
     if (!crop) return null;
+    // 图像未就绪时禁止产出空白图（否则 OCR 空结果、贴图白屏连锁）
+    if (!imageRef.current) return null;
     const offscreen = document.createElement('canvas');
     offscreen.width = crop.width;
     offscreen.height = crop.height;
@@ -1021,37 +1056,46 @@ function CaptureScreen({ mode }: { mode: string }) {
   };
 
   // Output action triggers (uses reliable offscreen canvas to guarantee non-empty image)
-  const handleOutput = async (action: string) => {
+  // busy 看门狗：命令挂起 20s 也强制复位，杜绝按钮永久灰死
+  const runBusy = async (fn: (dataUrl: string) => Promise<void>, failMsg: string) => {
     if (busy) return;
     const dataUrl = getCroppedDataUrl();
     if (!dataUrl) {
-      showToast('未选择有效截图区域');
+      showToast(imageRef.current ? '未选择有效截图区域' : '截图图像尚未就绪，请稍候重试');
       return;
     }
     setBusy(true);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      setBusy(false);
+      showToast('操作超时，请重试');
+    }, 20000);
     try {
-      await call('capture_output', { data: dataUrl, action });
+      await fn(dataUrl);
     } catch (e) {
-      showToast((e as Error).message || '操作失败');
+      if (!timedOut) showToast((e as Error).message || failMsg);
     } finally {
+      clearTimeout(timer);
       setBusy(false);
     }
   };
 
+  const handleOutput = async (action: string) => {
+    await runBusy(
+      async dataUrl => {
+        await call('capture_output', { data: dataUrl, action });
+      },
+      '操作失败'
+    );
+  };
+
   // Perform translation directly on crop
   const handleTranslate = async () => {
-    if (busy) return;
-    const dataUrl = getCroppedDataUrl();
-    if (!dataUrl) return;
-    setBusy(true);
-    try {
+    await runBusy(async dataUrl => {
       await call('capture_output', { data: dataUrl, action: 'ocr' });
       void call('cancel_capture');
-    } catch (e) {
-      showToast((e as Error).message || '文字识别失败');
-    } finally {
-      setBusy(false);
-    }
+    }, '文字识别失败');
   };
 
   // RENDER CONDITIONAL VIEWS AFTER ALL HOOKS
@@ -1675,7 +1719,14 @@ function CaptureScreen({ mode }: { mode: string }) {
           }}
           onClick={e => {
             e.stopPropagation();
-            void call('cancel_capture');
+            void call('cancel_capture').catch(() => {
+              // 命令失败时兜底关闭本窗口（capture 窗口可被下次截图重建）
+              try {
+                window.close();
+              } catch {
+                /* ignore */
+              }
+            });
           }}
           title="取消截图 (Esc)"
         >

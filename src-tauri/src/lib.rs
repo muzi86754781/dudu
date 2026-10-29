@@ -1021,7 +1021,7 @@ fn capture_output(
         "ocr" => {
             let text = ocr(&image)?;
             if text.trim().is_empty() {
-                return Err("没有识别出文字，请选择文字清晰的区域".into());
+                return Err("未识别到文字，请换一块区域重试".into());
             }
             Clipboard::new().map_err(err)?.set_text(text.clone()).map_err(err)?;
             let _ = app.emit("ocr-text", text);

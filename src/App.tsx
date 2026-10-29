@@ -70,7 +70,7 @@ export default function App() {
     ready: false,
     error: '',
     shortcutErrors: [],
-    version: '0.1.7',
+    version: '0.1.8',
     platform: '',
   });
   const [toast, setToast] = useState('');
@@ -90,10 +90,11 @@ export default function App() {
   const [history, setHistory] = useState<Translation[]>([]);
   const [edit, setEdit] = useState<Clip | null>(null);
   const [delay, setDelay] = useState(0);
-  const [windows, setWindows] = useState<{ id: number; title: string }[]>([]);
+  const [windows, setWindows] = useState<{ id: number; title: string }[] | null>(null);
   const [colors, setColors] = useState<string[]>([]);
   const [serialSeparator, setSerialSeparator] = useState('\n');
   const [logPreview, setLogPreview] = useState('');
+  const [clipboardWarn, setClipboardWarn] = useState('');
 
   const serial = useRef(0);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -136,6 +137,12 @@ export default function App() {
       setHistory(h);
       setEngine(s.engine);
       setTo(s.target);
+      // 启动事件早于本 effect 挂载可能已丢失：再主动拉一次剪贴板状态，保证 macOS 横幅不丢。
+      call<{ enabled: boolean; reason: string }>('clipboard_status')
+        .then(st => {
+          if (!st.enabled) setClipboardWarn(st.reason);
+        })
+        .catch(() => {});
     } catch (e) {
       setError((e as Error).message);
     }
@@ -159,6 +166,16 @@ export default function App() {
         notify('文字识别完成');
       }),
       on<string>('error', setError),
+      on<string>('capture-error', setError),
+      on<{ enabled: boolean; reason: string }>('clipboard-status', s => {
+        setClipboardWarn(s.enabled ? '' : s.reason);
+      }),
+      on('open-window-picker', () => {
+        setPage('capture');
+        void run(async () =>
+          setWindows((await call<{ id: number; title: string }[]>('list_windows')) ?? [])
+        );
+      }),
       on<string>('color', c => {
         setColors(prev => [c, ...prev.filter(x => x !== c)].slice(0, 10));
         notify(`已复制 ${c}`);
@@ -217,10 +234,13 @@ export default function App() {
     return () => window.removeEventListener('keydown', handler);
   }, [page, visible, active, consent, edit, busy]);
 
-  // Esc hides main window
+  // Esc hides main window（输入框/文本域聚焦时不响应，避免误隐藏）
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && desktop) void call('hide_main');
+      if (e.key !== 'Escape' || !desktop) return;
+      const el = document.activeElement as HTMLElement | null;
+      if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) return;
+      void call('hide_main');
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
@@ -403,6 +423,12 @@ export default function App() {
                   {settings.paused ? '继续记录' : '暂停记录'}
                 </button>
               </div>
+
+              {clipboardWarn && (
+                <div role="alert" className="error-banner">
+                  <span>{clipboardWarn}</span>
+                </div>
+              )}
 
               <div className="quick-actions">
                 <button
@@ -723,7 +749,9 @@ export default function App() {
                       disabled={busy}
                       onClick={() => {
                         if (mode === 'window') {
-                          void run(async () => setWindows(await call('list_windows')));
+                          void run(async () =>
+                            setWindows((await call<{ id: number; title: string }[]>('list_windows')) ?? [])
+                          );
                         } else {
                           void capture(String(mode));
                         }
@@ -1038,36 +1066,9 @@ export default function App() {
                 <h2>
                   <ScanLine size={18} /> 截图偏好
                 </h2>
-                <div className="setting-row">
-                  <div>
-                    <strong>默认保存格式</strong>
-                    <p>截图另存为文件时的首选图像格式</p>
-                  </div>
-                  <select
-                    value={draft.saveFormat || 'png'}
-                    onChange={e =>
-                      setDraft({ ...draft, saveFormat: e.target.value as Settings['saveFormat'] })
-                    }
-                  >
-                    <option value="png">PNG（高质量无损）</option>
-                    <option value="jpg">JPG（文件体积小）</option>
-                    <option value="webp">WebP（高压缩比现代格式）</option>
-                  </select>
-                </div>
-
-                <Toggle
-                  label="截图后自动复制到剪贴板"
-                  description="选区完成或点击确认时，自动将图片写入系统剪贴板"
-                  checked={draft.autoCopy}
-                  onChange={v => setDraft({ ...draft, autoCopy: v })}
-                />
-
-                <Toggle
-                  label="静默截图 OCR"
-                  description="按下截图 OCR 快捷键后，识别成功直接写入剪贴板，不展开全屏编辑"
-                  checked={draft.silentOcr}
-                  onChange={v => setDraft({ ...draft, silentOcr: v })}
-                />
+                <p className="setting-hint" style={{ marginTop: 0 }}>
+                  截图完成后默认写入剪贴板；另存为文件时按保存对话框所选扩展名决定格式。
+                </p>
               </section>
 
               {/* Clipboard & Privacy */}
@@ -1232,13 +1233,6 @@ export default function App() {
                     onChange={e => setDraft({ ...draft, timeout: +e.target.value })}
                   />
                 </label>
-
-                <Toggle
-                  label="剪贴板翻译"
-                  description="复制外文后在后台自动尝试预翻译并缓存"
-                  checked={draft.clipboardTranslate}
-                  onChange={v => setDraft({ ...draft, clipboardTranslate: v })}
-                />
               </section>
 
               {/* Global Shortcuts */}
@@ -1447,7 +1441,7 @@ export default function App() {
                 <p>
                   <strong>Q: 二维码识别与长截图如何使用？</strong>
                   <br />
-                  A: 截图框选包含二维码的区域后，工具栏上方会自动提示识别出的内容，支持一键复制或在默认浏览器中打开。在标注栏中点击「+ 拼入长图」可连续截取多屏并在完成后一键合并。
+                  A: 二维码识别功能正在规划中，当前版本暂未上线。在标注栏中点击「+ 拼入长图」可连续截取多屏并在完成后一键合并。
                 </p>
 
                 <div className="settings-buttons">
@@ -1602,7 +1596,7 @@ export default function App() {
       )}
 
       {/* Window Picker Modal */}
-      {windows.length > 0 && (
+      {windows && windows.length > 0 && (
         <div className="modal-backdrop">
           <section className="modal">
             <h2>选择要截取的窗口</h2>

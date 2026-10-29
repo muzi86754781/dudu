@@ -295,11 +295,14 @@ function CaptureScreen({ mode }: { mode: string }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
   const loupeCanvasRef = useRef<HTMLCanvasElement>(null);
-  const probeCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const longCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const probeCanvasRef = useRef<HTMLCanvasElement>(null);
+  const longCanvasRef = useRef<HTMLCanvasElement>(null);
   const inlineInputRef = useRef<HTMLInputElement>(null);
   const autoScrollTimer = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  // undo/redo 用最新快照计算，避免在 setState updater 内再调 setState（StrictMode 双调用会污染 redo 栈）
+  const shapesRef = useRef<Shape[]>([]);
+  const redoRef = useRef<Shape[]>([]);
 
   const showToast = useCallback((msg: string) => {
     setToast(msg);
@@ -456,6 +459,13 @@ function CaptureScreen({ mode }: { mode: string }) {
     renderAnnotations();
   }, [renderAnnotations]);
 
+  useEffect(() => {
+    shapesRef.current = shapes;
+  }, [shapes]);
+  useEffect(() => {
+    redoRef.current = redo;
+  }, [redo]);
+
   // 8. useEffect: Render 15x15 pixel grid onto magnifier loupe (Figure 1)
   useEffect(() => {
     if (crop || !hoverPoint || !imageRef.current || !loupeCanvasRef.current) return;
@@ -513,7 +523,7 @@ function CaptureScreen({ mode }: { mode: string }) {
     ctx.beginPath();
     ctx.moveTo(centerStart + cellSize / 2, 0);
     ctx.lineTo(centerStart + cellSize / 2, centerStart);
-    ctx.moveTo(centerStart + cellSize / 2, centerStart + cellSize);
+    ctx.moveTo(centerStart + cellSize / 2, centerStart + cellSize / 2);
     ctx.lineTo(centerStart + cellSize / 2, loupe.height);
     ctx.stroke();
 
@@ -622,6 +632,15 @@ function CaptureScreen({ mode }: { mode: string }) {
     if (!longCanvasRef.current) return;
     const dataUrl = longCanvasRef.current.toDataURL('image/png');
     await call('capture_output', { data: dataUrl, action: 'copy' });
+    showToast('长截图已完成并复制，是否另存为文件？');
+    const wantSave = window.confirm('长截图已完成并复制到剪贴板。是否另存为文件？');
+    if (wantSave) {
+      try {
+        await call('capture_output', { data: dataUrl, action: 'save' });
+      } catch {
+        // ignore
+      }
+    }
   }, []);
 
   const cancelLongCapture = useCallback(async () => {
@@ -749,7 +768,7 @@ function CaptureScreen({ mode }: { mode: string }) {
       // 5. Append new content to canvas
       const newCanvas = document.createElement('canvas');
       newCanvas.width = W;
-      newCanvas.height = Math.min(25000, H1 + appendHeight);
+      newCanvas.height = Math.min(16000, H1 + appendHeight);
       const newCtx = newCanvas.getContext('2d');
       if (!newCtx) return;
 
@@ -872,19 +891,19 @@ function CaptureScreen({ mode }: { mode: string }) {
   ]);
 
   const undoShape = () => {
-    setShapes(prev => {
-      if (!prev.length) return prev;
-      setRedo(r => [...r, prev[prev.length - 1]]);
-      return prev.slice(0, -1);
-    });
+    const prev = shapesRef.current;
+    if (!prev.length) return;
+    const last = prev[prev.length - 1];
+    setShapes(prev.slice(0, -1));
+    setRedo(r => [...r, last].slice(-100));
   };
 
   const redoShape = () => {
-    setRedo(prev => {
-      if (!prev.length) return prev;
-      setShapes(s => [...s, prev[prev.length - 1]]);
-      return prev.slice(0, -1);
-    });
+    const prev = redoRef.current;
+    if (!prev.length) return;
+    const last = prev[prev.length - 1];
+    setRedo(prev.slice(0, -1));
+    setShapes(s => [...s, last].slice(-100));
   };
 
   const addShape = (shape: Shape) => {

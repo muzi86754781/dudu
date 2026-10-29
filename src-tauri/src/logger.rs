@@ -72,11 +72,14 @@ pub fn log_raw(level: &str, target: &str, message: &str) {
         let _ = f.flush();
     }
 
-    // Write to temp log for fast user access
-    let p2 = get_temp_log_file();
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&p2) {
-        let _ = f.write_all(line.as_bytes());
-        let _ = f.flush();
+    // 临时日志仅在 debug 构建写出（release 包不再污染 %TEMP%）
+    #[cfg(debug_assertions)]
+    {
+        let p2 = get_temp_log_file();
+        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&p2) {
+            let _ = f.write_all(line.as_bytes());
+            let _ = f.flush();
+        }
     }
 }
 

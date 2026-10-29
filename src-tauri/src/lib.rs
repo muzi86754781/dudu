@@ -36,24 +36,13 @@ struct AppState {
     clipboard_suppress: AtomicBool,
 }
 
-#[cfg(target_os = "macos")]
-const CLIPBOARD_ENABLED: bool = false;
-#[cfg(not(target_os = "macos"))]
-const CLIPBOARD_ENABLED: bool = true;
-
 fn clipboard_status_payload() -> ClipboardStatus {
-    if CLIPBOARD_ENABLED {
-        ClipboardStatus {
-            enabled: true,
-            reason: String::new(),
-        }
-    } else {
-        ClipboardStatus {
-            enabled: false,
-            reason: "macOS 剪贴板记录暂不可用（前台应用探测未实现），计划 v0.2 恢复。当前仅支持 Windows。".into(),
-        }
+    ClipboardStatus {
+        enabled: true,
+        reason: String::new(),
     }
 }
+
 
 #[tauri::command]
 fn clipboard_status() -> ClipboardStatus {
@@ -443,8 +432,14 @@ fn selected_text<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<String>
         let selected = clipboard
             .get_text()
             .map_err(|_| "未能获取选中文字。请授予辅助功能权限后重试".to_string())?;
-        // 恢复旧剪贴板：原来是图片则恢复图片（修复旧版只恢复文本导致图片被覆盖丢失），否则恢复文本。
-        if let Some(img) = old_image {
+        // 恢复旧剪贴板：
+        // Windows 保留图片恢复；macOS 上 arboard set_image 有段错误嫌疑（v0.1.8 真机闪退），
+        // 仅恢复文本，恢复失败静默忽略，绝不影响翻译主流程。
+        if cfg!(target_os = "macos") {
+            if let Some(previous) = old_text {
+                let _ = clipboard.set_text(previous);
+            }
+        } else if let Some(img) = old_image {
             let _ = clipboard.set_image(img);
         } else if let Some(previous) = old_text {
             let _ = clipboard.set_text(previous);
@@ -817,6 +812,14 @@ fn capture_start_with_state<R: tauri::Runtime>(
         log_error!("capture", "未检测到可用显示器");
         return Err("未检测到可用显示器".into());
     }
+    // 记录光标所在屏的物理坐标：macOS 上截图叠加层只落在这块屏上（多屏落点）。
+    let (t_x, t_y, t_w, t_h): (Option<i32>, Option<i32>, Option<i32>, Option<i32>) =
+        if mode == "window" {
+            (None, None, None, None)
+        } else {
+            let t = monitor_under_cursor(&monitors);
+            (t.x().ok(), t.y().ok(), t.width().ok().map(|w| w as i32), t.height().ok().map(|h| h as i32))
+        };
     let image = if mode == "window" {
         let id = window_id.ok_or("请先选择一个窗口")?;
         let win = xcap::Window::all()
@@ -857,25 +860,48 @@ fn capture_start_with_state<R: tauri::Runtime>(
 
     if let Some(existing) = app.get_webview_window("capture") {
         log_info!("capture", "复用现有截图窗口，立即显示并重聚焦点");
-        let _ = existing.set_fullscreen(true);
-        let _ = existing.set_position(tauri::LogicalPosition::new(0.0, 0.0));
+        #[cfg(target_os = "windows")]
+        {
+            let _ = existing.set_fullscreen(true);
+            let _ = existing.set_position(tauri::LogicalPosition::new(0.0, 0.0));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use tauri::{PhysicalPosition, PhysicalSize};
+            if let (Some(x), Some(y), Some(w), Some(h)) = (t_x, t_y, t_w, t_h) {
+                let _ = existing.set_fullscreen(false);
+                let _ = existing.set_position(PhysicalPosition::new(x, y));
+                let _ = existing.set_size(PhysicalSize::new(w.max(1) as u32, h.max(1) as u32));
+            }
+        }
         let _ = existing.show();
         let _ = existing.unminimize();
         let _ = existing.set_focus();
         let _ = existing.emit("capture-ready", cap);
     } else {
-        log_info!("capture", "创建全新全屏截图窗口");
+        log_info!("capture", "创建全新截图叠加层");
         let url = WebviewUrl::App(format!("index.html?overlay={mode}").into());
-        let builder = WebviewWindowBuilder::new(app, "capture", url)
+        let mut builder = WebviewWindowBuilder::new(app, "capture", url)
             .title("dudu 截图工作台")
             .decorations(false)
             .always_on_top(true)
-            .skip_taskbar(true)
-            .fullscreen(true);
+            .skip_taskbar(true);
+        #[cfg(target_os = "windows")]
+        {
+            builder = builder.fullscreen(true);
+        }
         let win = builder.build().map_err(|e| {
             log_error!("capture", "创建截图窗口失败: {}", e);
             e.to_string()
         })?;
+        #[cfg(target_os = "macos")]
+        {
+            use tauri::{PhysicalPosition, PhysicalSize};
+            if let (Some(x), Some(y), Some(w), Some(h)) = (t_x, t_y, t_w, t_h) {
+                let _ = win.set_position(PhysicalPosition::new(x, y));
+                let _ = win.set_size(PhysicalSize::new(w.max(1) as u32, h.max(1) as u32));
+            }
+        }
         let _ = win.set_focus();
     }
     Ok(())
@@ -1071,6 +1097,53 @@ fn drag_window(app: tauri::AppHandle) -> Result<()> {
         .ok_or("贴图窗口已关闭")?
         .start_dragging()
         .map_err(err)
+}
+
+/// 通用窗口拖拽：由当前 webview 所在窗口自己调用（QuickTranslate 无框浮窗在
+/// macOS WKWebView 下 data-tauri-drag-region 不生效，改由 mousedown 调本命令）。
+#[tauri::command]
+fn start_window_drag(win: tauri::WebviewWindow) -> Result<()> {
+    win.start_dragging().map_err(err)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MacosPerms {
+    accessibility: bool,
+}
+
+/// macOS 权限探测：辅助功能权限通过 System Events 探测（未授权时 osascript 报错）。
+/// 屏幕录制权限在无 objc2 依赖下无法可靠查询，由前端按"未检测到"处理。
+#[tauri::command]
+fn macos_permissions() -> MacosPerms {
+    MacosPerms {
+        accessibility: macos_accessibility_trusted(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_accessibility_trusted() -> bool {
+    std::process::Command::new("osascript")
+        .arg("-e")
+        .arg("tell application \"System Events\" to get name of first process whose frontmost is true")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_accessibility_trusted() -> bool {
+    true
+}
+
+/// 打开 macOS 系统设置对应隐私面板：panel = "screen" | "accessibility"。
+#[tauri::command]
+fn open_macos_prefs(panel: String) -> Result<()> {
+    let url = match panel.as_str() {
+        "screen" => "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+        _ => "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+    };
+    open::that(url).map_err(err)
 }
 
 #[tauri::command]
@@ -1670,12 +1743,53 @@ fn foreground_app() -> String {
 
 #[cfg(target_os = "macos")]
 fn foreground_app() -> String {
-    String::new()
+    // 通过 System Events 查询前台进程名；未授予辅助功能权限时 osascript 退出码非零，
+    // 返回空串（permits() 会因 source 为空拒绝记录，前端据此提示权限引导）。
+    let out = match std::process::Command::new("osascript")
+        .arg("-e")
+        .arg("tell application \"System Events\" to get name of first process whose frontmost is true")
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return String::new(),
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .to_string()
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
 fn foreground_app() -> String {
     String::new()
+}
+
+/// 托盘菜单快捷键显示层转换：macOS 把 accelerator 字符串（Cmd+Shift+A）
+/// 转成符号（⌘⇧A）；Windows 维持原文。存储格式不变。
+fn shortcut_display(raw: &str) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        if raw.is_empty() {
+            return String::new();
+        }
+        let mut out = String::new();
+        for part in raw.split('+') {
+            let sym = match part.trim() {
+                "Command" | "Cmd" | "CommandOrControl" => "⌘",
+                "Control" | "Ctrl" => "⌃",
+                "Option" | "Alt" => "⌥",
+                "Shift" => "⇧",
+                "Super" => "",
+                other => other,
+            };
+            out.push_str(sym);
+        }
+        out
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        raw.to_string()
+    }
 }
 
 fn create_tray_menu<M: tauri::Manager<R>, R: tauri::Runtime>(
@@ -1694,13 +1808,13 @@ fn create_tray_menu<M: tauri::Manager<R>, R: tauri::Runtime>(
     let sc_selection = get_sc("selection");
     let sc_clipboard = get_sc("clipboard");
 
-    let title_region = if sc_region.is_empty() { "区域截图".into() } else { format!("区域截图 ({})", sc_region) };
-    let title_window = if sc_window.is_empty() { "窗口截图".into() } else { format!("窗口截图 ({})", sc_window) };
-    let title_fullscreen = if sc_fullscreen.is_empty() { "全屏截图".into() } else { format!("全屏截图 ({})", sc_fullscreen) };
-    let title_color = if sc_color.is_empty() { "屏幕取色".into() } else { format!("屏幕取色 ({})", sc_color) };
-    let title_translate = if sc_translate.is_empty() { "输入翻译".into() } else { format!("输入翻译 ({})", sc_translate) };
-    let title_selection = if sc_selection.is_empty() { "划词翻译".into() } else { format!("划词翻译 ({})", sc_selection) };
-    let title_clipboard = if sc_clipboard.is_empty() { "剪贴板历史".into() } else { format!("剪贴板历史 ({})", sc_clipboard) };
+    let title_region = if sc_region.is_empty() { "区域截图".into() } else { format!("区域截图 ({})", shortcut_display(&sc_region)) };
+    let title_window = if sc_window.is_empty() { "窗口截图".into() } else { format!("窗口截图 ({})", shortcut_display(&sc_window)) };
+    let title_fullscreen = if sc_fullscreen.is_empty() { "全屏截图".into() } else { format!("全屏截图 ({})", shortcut_display(&sc_fullscreen)) };
+    let title_color = if sc_color.is_empty() { "屏幕取色".into() } else { format!("屏幕取色 ({})", shortcut_display(&sc_color)) };
+    let title_translate = if sc_translate.is_empty() { "输入翻译".into() } else { format!("输入翻译 ({})", shortcut_display(&sc_translate)) };
+    let title_selection = if sc_selection.is_empty() { "划词翻译".into() } else { format!("划词翻译 ({})", shortcut_display(&sc_selection)) };
+    let title_clipboard = if sc_clipboard.is_empty() { "剪贴板历史".into() } else { format!("剪贴板历史 ({})", shortcut_display(&sc_clipboard)) };
     let title_pause = if settings.paused { "继续剪贴板记录" } else { "暂停剪贴板记录" };
 
     let item_region = MenuItem::with_id(manager, "region", title_region, true, None::<&str>)?;
@@ -1825,6 +1939,12 @@ fn build_tray<R: tauri::Runtime>(app: &tauri::App<R>, settings: &Settings) -> ta
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // panic 落盘：真机闪退时把堆栈写进日志目录，下一轮复现可定位段错误/panic 点。
+    std::panic::set_hook(Box::new(|info| {
+        let msg = format!("PANIC: {}\nBacktrace:\n{:?}", info, std::backtrace::Backtrace::capture());
+        log_error!("panic", "{}", msg);
+        eprintln!("{}", msg);
+    }));
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             let _ = show_main(app);
@@ -1862,12 +1982,11 @@ pub fn run() {
                     format!("部分快捷键被其他应用占用：{}", icon_errors.join("；")),
                 );
             }
-            // macOS 暂未实现前台应用探测：剪贴板记录整体停用并向前端广播状态。
+            // 剪贴板记录全平台启用；macOS 前台探测不可用（无辅助功能权限）时
+            // foreground_app() 返回空串，permits() 自然拒绝入库，不静默记录。
             let status = clipboard_status_payload();
             let _ = app.emit("clipboard-status", status);
-            if CLIPBOARD_ENABLED {
-                start_listener(app.handle().clone(), db_path);
-            }
+            start_listener(app.handle().clone(), db_path);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1894,6 +2013,9 @@ pub fn run() {
             edit_pin,
             close_pin,
             drag_window,
+            start_window_drag,
+            macos_permissions,
+            open_macos_prefs,
             capture_color,
             cancel_capture,
             set_long_capture_mode,

@@ -28,6 +28,12 @@ const LANGUAGES = [
   { id: 'es', label: '西班牙语' },
   { id: 'ru', label: '俄语' },
 ];
+// 目标语言选项：智能配对（auto）由后端按输入文本决定目标语言
+const TARGET_LANGS = [
+  { id: 'auto', label: '自动（智能配对）' },
+  ...LANGUAGES.filter(l => l.id !== 'auto'),
+];
+
 
 const ENGINES = [
   { id: 'google', name: 'Google翻译', icon: '🌐' },
@@ -40,7 +46,7 @@ export default function QuickTranslate() {
   const [pinned, setPinned] = useState(true);
   const [text, setText] = useState('');
   const [from, setFrom] = useState('auto');
-  const [to, setTo] = useState('zh-CN');
+  const [to, setTo] = useState('auto');
   const [engine, setEngine] = useState('google');
   const [result, setResult] = useState('');
   const [loading, setLoading] = useState(false);
@@ -391,7 +397,7 @@ export default function QuickTranslate() {
                 if (text) void doTranslate(text, from, e.target.value, engine);
               }}
             >
-              {LANGUAGES.filter(l => l.id !== 'auto').map(lang => (
+              {TARGET_LANGS.map(lang => (
                 <option key={lang.id} value={lang.id}>
                   {lang.label}
                 </option>

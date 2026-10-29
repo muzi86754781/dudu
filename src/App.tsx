@@ -85,7 +85,7 @@ export default function App() {
   const [source, setSource] = useState('');
   const [result, setResult] = useState('');
   const [from, setFrom] = useState('auto');
-  const [to, setTo] = useState('zh-CN');
+  const [to, setTo] = useState('auto');
   const [engine, setEngine] = useState('google');
   const [history, setHistory] = useState<Translation[]>([]);
   const [edit, setEdit] = useState<Clip | null>(null);
@@ -834,6 +834,7 @@ export default function App() {
                   </button>
 
                   <select aria-label="目标语言" value={to} onChange={e => setTo(e.target.value)}>
+                    <option value="auto">自动（智能配对）</option>
                     <option value="zh-CN">简体中文</option>
                     <option value="zh-TW">繁體中文</option>
                     <option value="en">English</option>

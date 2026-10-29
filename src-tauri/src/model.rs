@@ -94,7 +94,7 @@ impl Default for Settings {
             ignore_words: String::new(),
             theme: "system".into(),
             engine: "google".into(),
-            target: "zh-CN".into(),
+            target: "auto".into(),
             deepl_key: String::new(),
             baidu_id: String::new(),
             baidu_key: String::new(),

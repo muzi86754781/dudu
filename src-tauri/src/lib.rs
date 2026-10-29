@@ -461,7 +461,6 @@ fn translation_history(state: tauri::State<'_, AppState>) -> Result<Vec<Translat
     state.db.lock().map_err(err)?.history()
 }
 
-#[tauri::command]
 /// 目标语言智能配对（v0.1.9 中英互配）：
 /// 中文文本（含汉字且无日文假名）→ 英文；日文（含假名）与其他语言 → 简体中文。
 fn smart_target(text: &str) -> &'static str {
@@ -482,6 +481,7 @@ fn smart_target(text: &str) -> &'static str {
     }
 }
 
+#[tauri::command]
 async fn translate(
     state: tauri::State<'_, AppState>,
     text: String,

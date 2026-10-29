@@ -1,6 +1,6 @@
 [package]
 name = "dudu"
-version = "0.1.7"
+version = "0.1.8"
 description = "Local-first capture, translation and clipboard workspace"
 authors = ["dudu contributors"]
 edition = "2021"

@@ -462,6 +462,26 @@ fn translation_history(state: tauri::State<'_, AppState>) -> Result<Vec<Translat
 }
 
 #[tauri::command]
+/// 目标语言智能配对（v0.1.9 中英互配）：
+/// 中文文本（含汉字且无日文假名）→ 英文；日文（含假名）与其他语言 → 简体中文。
+fn smart_target(text: &str) -> &'static str {
+    let mut cjk = 0u32;
+    let mut kana = 0u32;
+    for c in text.chars() {
+        let cp = c as u32;
+        if (0x4E00..=0x9FFF).contains(&cp) || (0x3400..=0x4DBF).contains(&cp) {
+            cjk += 1;
+        } else if (0x3040..=0x30FF).contains(&cp) {
+            kana += 1;
+        }
+    }
+    if cjk > 0 && kana == 0 {
+        "en"
+    } else {
+        "zh-CN"
+    }
+}
+
 async fn translate(
     state: tauri::State<'_, AppState>,
     text: String,
@@ -474,7 +494,7 @@ async fn translate(
     }
     if !["auto", "zh-CN", "zh-TW", "en", "ja", "ko", "fr", "de", "es", "ru"]
         .contains(&from.as_str())
-        || !["zh-CN", "zh-TW", "en", "ja", "ko", "fr", "de", "es", "ru"]
+        || !["auto", "zh-CN", "zh-TW", "en", "ja", "ko", "fr", "de", "es", "ru"]
             .contains(&to.as_str())
     {
         return Err("暂不支持所选语言".into());
@@ -483,10 +503,16 @@ async fn translate(
         return Err("未知翻译引擎".into());
     }
     let config = state.settings()?;
+    // 目标语言智能配对：to == "auto" 时按输入文本自动决定目标语言
+    let effective_to = if to == "auto" {
+        smart_target(&text).to_string()
+    } else {
+        to.clone()
+    };
     let mut hash = Sha256::new();
     hash.update(&text);
     hash.update(&from);
-    hash.update(&to);
+    hash.update(&effective_to);
     hash.update(&engine);
     let id = format!("{:x}", hash.finalize());
     if let Some(mut cached) = state.db.lock().map_err(err)?.cached(&id)? {
@@ -498,24 +524,24 @@ async fn translate(
         .build()
         .map_err(err)?;
     let result = match engine.as_str() {
-        "google" => google_translate(&client, &text, &from, &to).await?,
+        "google" => google_translate(&client, &text, &from, &effective_to).await?,
         "deepl" => {
             if config.deepl_key.trim().is_empty() {
                 return Err("请先在偏好设置中填入 DeepL Free API Key".into());
             }
-            deepl_translate(&client, &text, &from, &to, &config.deepl_key).await?
+            deepl_translate(&client, &text, &from, &effective_to, &config.deepl_key).await?
         }
         "baidu" => {
             if config.baidu_id.trim().is_empty() || config.baidu_key.trim().is_empty() {
                 return Err("请先在偏好设置中填入百度 App ID 与密钥".into());
             }
-            baidu_translate(&client, &text, &from, &to, &config.baidu_id, &config.baidu_key).await?
+            baidu_translate(&client, &text, &from, &effective_to, &config.baidu_id, &config.baidu_key).await?
         }
         "youdao" => {
             if config.youdao_key.trim().is_empty() || config.youdao_secret.trim().is_empty() {
                 return Err("请先在偏好设置中填入有道智云 App Key 与应用密钥".into());
             }
-            youdao_translate(&client, &text, &from, &to, &config.youdao_key, &config.youdao_secret).await?
+            youdao_translate(&client, &text, &from, &effective_to, &config.youdao_key, &config.youdao_secret).await?
         }
         _ => unreachable!(),
     };
@@ -525,7 +551,7 @@ async fn translate(
         result,
         engine,
         from,
-        to,
+        to: effective_to,
         created: now(),
         cached: false,
     };
@@ -1020,7 +1046,7 @@ fn capture_output(
         "ocr" => {
             let text = ocr(&image)?;
             if text.trim().is_empty() {
-                return Err("没有识别出文字，请选择文字清晰的区域".into());
+                return Err("未识别到文字，请换一块区域重试".into());
             }
             Clipboard::new().map_err(err)?.set_text(text.clone()).map_err(err)?;
             let _ = app.emit("ocr-text", text);
@@ -1559,6 +1585,47 @@ fn ocr(_: &DynamicImage) -> Result<String> {
     Err("此版本仅提供 Windows 和 macOS OCR".into())
 }
 
+/// 读取剪贴板中的文件列表（Windows CF_HDROP）；非 Windows 平台返回空。
+#[cfg(target_os = "windows")]
+fn clipboard_files() -> Vec<String> {
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, GetClipboardData, OpenClipboard,
+    };
+    use windows::Win32::System::Ole::CF_HDROP;
+    use windows::Win32::UI::Shell::{DragFinish, DragQueryFileW, HDROP};
+    unsafe {
+        if OpenClipboard(None).is_err() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        if let Ok(handle) = GetClipboardData(CF_HDROP.0 as u32) {
+            let drop = HDROP(handle.0);
+            let count = DragQueryFileW(drop, u32::MAX, None);
+            for i in 0..count {
+                let len = DragQueryFileW(drop, i, None);
+                if len == 0 {
+                    continue;
+                }
+                let mut buf = vec![0u16; len as usize];
+                DragQueryFileW(drop, i, Some(&mut buf));
+                let mut path = String::from_utf16_lossy(&buf);
+                while path.ends_with('\0') {
+                    path.pop();
+                }
+                out.push(path);
+            }
+            DragFinish(drop);
+        }
+        let _ = CloseClipboard();
+        out
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn clipboard_files() -> Vec<String> {
+    Vec::new()
+}
+
 fn start_listener(app: tauri::AppHandle, db_path: PathBuf) {
     std::thread::Builder::new()
         .name("dudu-clipboard".into())
@@ -1567,6 +1634,7 @@ fn start_listener(app: tauri::AppHandle, db_path: PathBuf) {
             let Ok(mut clipboard) = Clipboard::new() else { return };
             let mut last_text = String::new();
             let mut last_image = String::new();
+            let mut last_files = String::new();
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(600));
                 let Some(state) = app.try_state::<AppState>() else { break };
@@ -1586,7 +1654,9 @@ fn start_listener(app: tauri::AppHandle, db_path: PathBuf) {
                     }
                     continue;
                 }
+                let mut text_seen = false;
                 if let Ok(text) = clipboard.get_text() {
+                    text_seen = true;
                     let text = text.trim_end_matches('\0').to_owned();
                     if !text.trim().is_empty()
                         && text.len() <= 128 * 1024
@@ -1683,6 +1753,56 @@ fn start_listener(app: tauri::AppHandle, db_path: PathBuf) {
                                                     s.clips(false).unwrap_or_default(),
                                                 );
                                             }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // 剪贴板含文件（Windows CF_HDROP）：记录为 file 类型（文本优先，避免双录）
+                if !text_seen {
+                    let files = clipboard_files();
+                    if !files.is_empty() {
+                        let joined = files.join("\n");
+                        let hash = format!("{:x}", Sha256::digest(joined.as_bytes()));
+                        if hash != last_files {
+                            let source = foreground_app();
+                            if !settings.permits(&source, "") {
+                                last_files = hash;
+                                continue;
+                            }
+                            let title = files
+                                .first()
+                                .map(|f| {
+                                    f.rsplit(['/', '\\'])
+                                        .next()
+                                        .unwrap_or("")
+                                        .chars()
+                                        .take(80)
+                                        .collect::<String>()
+                                })
+                                .unwrap_or_else(|| "文件".into());
+                            let c = Clip {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                kind: "file".into(),
+                                content: joined.clone(),
+                                title,
+                                source: source.clone(),
+                                created: now(),
+                                favorite: false,
+                            };
+                            if let Some(s) = app.try_state::<AppState>() {
+                                if let Ok(db) = s.db.lock() {
+                                    if !db.is_recent_duplicate("file", &joined, 300_000) {
+                                        let inserted = db.insert(&c, "", settings.limit).is_ok();
+                                        drop(db);
+                                        if inserted {
+                                            last_files = hash;
+                                            let _ = app.emit(
+                                                "clips",
+                                                s.clips(false).unwrap_or_default(),
+                                            );
                                         }
                                     }
                                 }

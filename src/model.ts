@@ -2,7 +2,7 @@ export type Page = 'clipboard' | 'capture' | 'translate' | 'settings' | 'help';
 
 export interface Clip {
   id: string;
-  kind: 'text' | 'image';
+  kind: 'text' | 'image' | 'file';
   content: string;
   source: string;
   created: number;
@@ -77,7 +77,7 @@ export const defaults: Settings = {
   ignoreWords: '',
   theme: 'system',
   engine: 'google',
-  target: 'zh-CN',
+  target: 'auto',
   deeplKey: '',
   baiduId: '',
   baiduKey: '',

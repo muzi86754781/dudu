@@ -143,6 +143,16 @@ export default function App() {
           if (!st.enabled) setClipboardWarn(st.reason);
         })
         .catch(() => {});
+      // macOS 权限前置引导：辅助功能未授权时剪贴板记录无法读取来源应用（Windows 恒 true）。
+      call<{ accessibility: boolean }>('macos_permissions')
+        .then(m => {
+          if (!m.accessibility) {
+            setClipboardWarn(
+              'macOS 辅助功能权限未授予：剪贴板记录无法读取来源应用，相关记录不会入库。请前往 系统设置 → 隐私与安全性 → 辅助功能 授权 dudu。'
+            );
+          }
+        })
+        .catch(() => {});
     } catch (e) {
       setError((e as Error).message);
     }
@@ -427,6 +437,12 @@ export default function App() {
               {clipboardWarn && (
                 <div role="alert" className="error-banner">
                   <span>{clipboardWarn}</span>
+                  <button
+                    className="banner-action"
+                    onClick={() => void call('open_macos_prefs', { panel: 'accessibility' })}
+                  >
+                    打开系统设置
+                  </button>
                 </div>
               )}
 
@@ -720,7 +736,7 @@ export default function App() {
                     都值得顺手表达。
                   </h2>
                   <p>
-                    支持矩形、椭圆、直线、箭头、手绘、文字、高亮、马赛克及步骤标记。完成标注后可一键复制图片、导出文件、复制 Markdown 或置顶贴图。
+                    支持矩形、椭圆、箭头、手绘、文字、马赛克及步骤标记。完成标注后可一键复制图片、导出文件或置顶贴图。
                   </p>
                   <button
                     className="primary"
@@ -1168,6 +1184,18 @@ export default function App() {
                     <option value="google">Google 翻译（免费通用免配置）</option>
                     <option value="deepl">DeepL Free</option>
                     <option value="baidu">百度翻译</option>
+                  </select>
+                </label>
+
+                <label className="setting-field">
+                  默认目标语言
+                  <select
+                    value={draft.target}
+                    onChange={e => setDraft({ ...draft, target: e.target.value })}
+                  >
+                    <option value="auto">自动（智能配对）</option>
+                    <option value="zh-CN">简体中文</option>
+                    <option value="en">英文</option>
                   </select>
                 </label>
 

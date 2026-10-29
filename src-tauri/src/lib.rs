@@ -62,7 +62,7 @@ fn clipboard_status() -> ClipboardStatus {
 
 /// 光标所在显示器；取不到时回退主屏，再回退第一块。
 fn monitor_under_cursor(monitors: &[xcap::Monitor]) -> &xcap::Monitor {
-    if let Ok(mut enigo) = Enigo::new(&InputSettings::default()) {
+    if let Ok(enigo) = Enigo::new(&InputSettings::default()) {
         if let Ok((cx, cy)) = enigo.location() {
             for m in monitors {
                 if let (Ok(x), Ok(y), Ok(w), Ok(h)) = (m.x(), m.y(), m.width(), m.height()) {
@@ -136,7 +136,7 @@ fn register_shortcuts<R: tauri::Runtime>(
                     let a = app_clone.clone();
                     std::thread::spawn(move || {
                         let _ = show_main(&a);
-                        let _ = a.emit("open-window-picker");
+                        let _ = a.emit("open-window-picker", ());
                     });
                 }
                 "region" | "fullscreen" | "ocr" | "color" => {
@@ -418,12 +418,14 @@ fn paste_shortcut() -> Result<()> {
     result.map_err(err)
 }
 
-fn selected_text(app: &tauri::AppHandle) -> Result<String> {
+fn selected_text<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<String> {
     // 偷剪贴板期间挂起 listener 记录，并在恢复后延迟 200ms 再解除，避免选中词被误记进历史。
-    let suppress = app.try_state::<AppState>().map(|s| &s.clipboard_suppress);
-    if let Some(s) = suppress {
-        s.store(true, Ordering::Release);
-    }
+    let set_suppress = |v: bool| {
+        if let Some(s) = app.try_state::<AppState>() {
+            s.clipboard_suppress.store(v, Ordering::Release);
+        }
+    };
+    set_suppress(true);
     let result = (|| -> Result<String> {
         let mut clipboard = Clipboard::new().map_err(err)?;
         let old_text = clipboard.get_text().ok();
@@ -455,10 +457,8 @@ fn selected_text(app: &tauri::AppHandle) -> Result<String> {
         }
         Ok(selected)
     })();
-    if let Some(s) = suppress {
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        s.store(false, Ordering::Release);
-    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    set_suppress(false);
     result
 }
 
@@ -1102,9 +1102,9 @@ fn set_long_capture_mode(
     app: tauri::AppHandle,
     enabled: bool,
     x: u32,
-    y: u32,
+    _y: u32,
     width: u32,
-    height: u32,
+    _height: u32,
 ) -> Result<()> {
     let Some(capture_win) = app.get_webview_window("capture") else {
         return Ok(());
@@ -1322,8 +1322,7 @@ fn export_data(state: tauri::State<'_, AppState>) -> Result<()> {
         return Err("备份超过 64 MB".into());
     }
     if let Some(path) = rfd::FileDialog::new()
-        .set_title("导出 dudu 备份（内容未加密）")
-        .set_message("自 v0.1.8 起备份已剔除翻译 API 密钥；备份仍含剪贴板明文内容，请妥善保管、勿外传。")
+        .set_title("导出 dudu 备份（内容未加密；自 v0.1.8 已剔除 API 密钥，仍含剪贴板明文，勿外传）")
         .set_file_name(format!("dudu-backup-{}.json", chrono_stamp()))
         .add_filter("JSON 文件", &["json"])
         .save_file()
@@ -1764,7 +1763,7 @@ fn build_tray<R: tauri::Runtime>(app: &tauri::App<R>, settings: &Settings) -> ta
             "window" => {
                 // 与快捷键路径一致：先抬主窗再让前端打开窗口列表。
                 let _ = show_main(app);
-                let _ = app.emit("open-window-picker");
+                let _ = app.emit("open-window-picker", ());
             }
             "fullscreen" => {
                 let a = app.clone();
@@ -1787,7 +1786,7 @@ fn build_tray<R: tauri::Runtime>(app: &tauri::App<R>, settings: &Settings) -> ta
             "selection" => {
                 let a = app.clone();
                 std::thread::spawn(move || {
-                    let text = selected_text().ok();
+                    let text = selected_text(&a).ok();
                     let _ = show_quick_translate(&a, text);
                 });
             }

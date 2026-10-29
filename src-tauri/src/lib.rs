@@ -7,13 +7,14 @@ use arboard::Clipboard;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use enigo::{Axis, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings as InputSettings};
 use image::{DynamicImage, GenericImageView, ImageFormat, ImageReader, RgbaImage};
-use model::{err, now, Capture, Clip, Result, Settings, Status, Translation};
+use model::{err, now, Capture, Clip, ClipboardStatus, Result, Settings, Status, Translation};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     io::Cursor,
     path::PathBuf,
+    sync::atomic::{AtomicBool, Ordering},
     sync::{Mutex, RwLock},
 };
 use tauri::{
@@ -31,6 +32,51 @@ struct AppState {
     capture: RwLock<Option<RgbaImage>>,
     capture_cache: RwLock<Option<Capture>>,
     data_dir: PathBuf,
+    /// 划词偷剪贴板期间置位，listener 轮询见此标志只同步 last_*、不入库。
+    clipboard_suppress: AtomicBool,
+}
+
+#[cfg(target_os = "macos")]
+const CLIPBOARD_ENABLED: bool = false;
+#[cfg(not(target_os = "macos"))]
+const CLIPBOARD_ENABLED: bool = true;
+
+fn clipboard_status_payload() -> ClipboardStatus {
+    if CLIPBOARD_ENABLED {
+        ClipboardStatus {
+            enabled: true,
+            reason: String::new(),
+        }
+    } else {
+        ClipboardStatus {
+            enabled: false,
+            reason: "macOS 剪贴板记录暂不可用（前台应用探测未实现），计划 v0.2 恢复。当前仅支持 Windows。".into(),
+        }
+    }
+}
+
+#[tauri::command]
+fn clipboard_status() -> ClipboardStatus {
+    clipboard_status_payload()
+}
+
+/// 光标所在显示器；取不到时回退主屏，再回退第一块。
+fn monitor_under_cursor(monitors: &[xcap::Monitor]) -> &xcap::Monitor {
+    if let Ok(mut enigo) = Enigo::new(&InputSettings::default()) {
+        if let Ok((cx, cy)) = enigo.location() {
+            for m in monitors {
+                if let (Ok(x), Ok(y), Ok(w), Ok(h)) = (m.x(), m.y(), m.width(), m.height()) {
+                    if cx >= x && cx < x + w as i32 && cy >= y && cy < y + h as i32 {
+                        return m;
+                    }
+                }
+            }
+        }
+    }
+    monitors
+        .iter()
+        .find(|m| m.is_primary().unwrap_or(false))
+        .unwrap_or(&monitors[0])
 }
 
 impl AppState {
@@ -84,14 +130,24 @@ fn register_shortcuts<R: tauri::Runtime>(
                     let _ = app_clone.emit("navigate", "clipboard");
                     let _ = show_main(&app_clone);
                 }
-                "region" | "window" | "fullscreen" | "ocr" | "color" => {
+                "window" => {
+                    // 不再直接 capture_start("window",None)：先把主窗抬到前台并让前端打开窗口列表，
+                    // 用户选中窗口后再走 start_capture(window, id)。
+                    let a = app_clone.clone();
+                    std::thread::spawn(move || {
+                        let _ = show_main(&a);
+                        let _ = a.emit("open-window-picker");
+                    });
+                }
+                "region" | "fullscreen" | "ocr" | "color" => {
                     let mode = action_id.clone();
                     let a = app_clone.clone();
                     log_info!("shortcut", "快捷键触发截图: 模式={}", mode);
                     std::thread::spawn(move || {
                         if let Err(e) = capture_start(&a, &mode, 0, None) {
                             log_error!("shortcut", "截图启动失败: {}", e);
-                            let _ = a.emit("error", e);
+                            let _ = a.emit("error", e.clone());
+                            let _ = a.emit("capture-error", e);
                         }
                     });
                 }
@@ -108,7 +164,7 @@ fn register_shortcuts<R: tauri::Runtime>(
                     let a = app_clone.clone();
                     log_info!("shortcut", "快捷键触发: 划词翻译");
                     std::thread::spawn(move || {
-                        let text = selected_text().ok();
+                        let text = selected_text(&a).ok();
                         if let Err(e) = show_quick_translate(&a, text) {
                             log_error!("shortcut", "唤起划词翻译失败: {}", e);
                         }
@@ -362,32 +418,48 @@ fn paste_shortcut() -> Result<()> {
     result.map_err(err)
 }
 
-fn selected_text() -> Result<String> {
-    let mut clipboard = Clipboard::new().map_err(err)?;
-    let old = clipboard.get_text().ok();
-    let mut e = Enigo::new(&InputSettings::default()).map_err(err)?;
-    let modifier = if cfg!(target_os = "macos") {
-        Key::Meta
-    } else {
-        Key::Control
-    };
-    e.key(modifier, Direction::Press).map_err(err)?;
-    e.key(Key::Unicode('c'), Direction::Click).map_err(err)?;
-    let _ = e.key(modifier, Direction::Release);
-    std::thread::sleep(std::time::Duration::from_millis(140));
-    let selected = clipboard
-        .get_text()
-        .map_err(|_| "未能获取选中文字。请授予辅助功能权限后重试".to_string())?;
-    if let Some(previous) = old {
-        let _ = clipboard.set_text(previous);
+fn selected_text(app: &tauri::AppHandle) -> Result<String> {
+    // 偷剪贴板期间挂起 listener 记录，并在恢复后延迟 200ms 再解除，避免选中词被误记进历史。
+    let suppress = app.try_state::<AppState>().map(|s| &s.clipboard_suppress);
+    if let Some(s) = suppress {
+        s.store(true, Ordering::Release);
     }
-    if selected.trim().is_empty() {
-        return Err("未检测到选中文字。请先选中文字再按快捷键".into());
+    let result = (|| -> Result<String> {
+        let mut clipboard = Clipboard::new().map_err(err)?;
+        let old_text = clipboard.get_text().ok();
+        let old_image = clipboard.get_image().ok();
+        let mut e = Enigo::new(&InputSettings::default()).map_err(err)?;
+        let modifier = if cfg!(target_os = "macos") {
+            Key::Meta
+        } else {
+            Key::Control
+        };
+        e.key(modifier, Direction::Press).map_err(err)?;
+        e.key(Key::Unicode('c'), Direction::Click).map_err(err)?;
+        let _ = e.key(modifier, Direction::Release);
+        std::thread::sleep(std::time::Duration::from_millis(140));
+        let selected = clipboard
+            .get_text()
+            .map_err(|_| "未能获取选中文字。请授予辅助功能权限后重试".to_string())?;
+        // 恢复旧剪贴板：原来是图片则恢复图片（修复旧版只恢复文本导致图片被覆盖丢失），否则恢复文本。
+        if let Some(img) = old_image {
+            let _ = clipboard.set_image(img);
+        } else if let Some(previous) = old_text {
+            let _ = clipboard.set_text(previous);
+        }
+        if selected.trim().is_empty() {
+            return Err("未检测到选中文字。请先选中文字再按快捷键".into());
+        }
+        if selected.len() > 100_000 {
+            return Err("选中文字超过 100 KB".into());
+        }
+        Ok(selected)
+    })();
+    if let Some(s) = suppress {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        s.store(false, Ordering::Release);
     }
-    if selected.len() > 100_000 {
-        return Err("选中文字超过 100 KB".into());
-    }
-    Ok(selected)
+    result
 }
 
 #[tauri::command]
@@ -493,7 +565,9 @@ async fn google_translate(
         ])
         .send()
         .await
-        .map_err(|_| "连接 Google 翻译失败，请检查网络或切换引擎".to_string())?;
+        .map_err(|_| {
+            "Google 翻译在当前网络环境不可达，请在设置中切换引擎（DeepL/百度/有道）或配置对应 API 密钥。".to_string()
+        })?;
     if !response.status().is_success() {
         return Err(format!(
             "Google 翻译返回 {}，请更换引擎或稍后重试",
@@ -752,14 +826,11 @@ fn capture_start_with_state<R: tauri::Runtime>(
             .ok_or("所选窗口已关闭")?;
         win.capture_image().map_err(err)?
     } else {
-        let primary = monitors
-            .iter()
-            .find(|m| m.is_primary().unwrap_or(false))
-            .unwrap_or(&monitors[0]);
-        primary
+        let target = monitor_under_cursor(&monitors);
+        target
             .capture_image()
             .map_err(|e| {
-                log_error!("capture", "主屏幕捕获失败: {}", e);
+                log_error!("capture", "目标屏幕捕获失败: {}", e);
                 "无法捕获屏幕。请确认 dudu 已获得屏幕录制权限".to_string()
             })?
     };
@@ -1040,11 +1111,8 @@ fn set_long_capture_mode(
     };
     if enabled {
         let monitors = xcap::Monitor::all().map_err(err)?;
-        let primary = monitors
-            .iter()
-            .find(|m| m.is_primary().unwrap_or(false))
-            .unwrap_or(&monitors[0]);
-        let screen_w = primary.width().map_err(err)? as f64;
+        let target = monitor_under_cursor(&monitors);
+        let screen_w = target.width().map_err(err)? as f64;
 
         let hud_w = 380.0;
         let hud_h = 720.0;
@@ -1119,11 +1187,8 @@ fn scroll_and_capture_slice(
     }
 
     let monitors = xcap::Monitor::all().map_err(err)?;
-    let primary = monitors
-        .iter()
-        .find(|m| m.is_primary().unwrap_or(false))
-        .unwrap_or(&monitors[0]);
-    let img = primary.capture_image().map_err(err)?;
+    let target = monitor_under_cursor(&monitors);
+    let img = target.capture_image().map_err(err)?;
 
     let sub_w = width.min(img.width().saturating_sub(x));
     let sub_h = height.min(img.height().saturating_sub(y));
@@ -1237,7 +1302,13 @@ fn clear_history(state: tauri::State<'_, AppState>) -> Result<()> {
 #[tauri::command]
 fn export_data(state: tauri::State<'_, AppState>) -> Result<()> {
     let clips = state.clips(true)?;
-    let settings = state.settings()?;
+    let mut settings = state.settings()?;
+    // 备份是明文 JSON：导出前清空所有翻译 API 密钥，避免密钥随备份文件扩散。
+    settings.deepl_key.clear();
+    settings.baidu_id.clear();
+    settings.baidu_key.clear();
+    settings.youdao_key.clear();
+    settings.youdao_secret.clear();
     let translations = state.db.lock().map_err(err)?.history()?;
     let content = serde_json::json!({
         "schemaVersion": 1,
@@ -1252,6 +1323,7 @@ fn export_data(state: tauri::State<'_, AppState>) -> Result<()> {
     }
     if let Some(path) = rfd::FileDialog::new()
         .set_title("导出 dudu 备份（内容未加密）")
+        .set_message("自 v0.1.8 起备份已剔除翻译 API 密钥；备份仍含剪贴板明文内容，请妥善保管、勿外传。")
         .set_file_name(format!("dudu-backup-{}.json", chrono_stamp()))
         .add_filter("JSON 文件", &["json"])
         .save_file()
@@ -1271,7 +1343,7 @@ struct Backup {
 }
 
 #[tauri::command]
-fn import_data(state: tauri::State<'_, AppState>) -> Result<Vec<Clip>> {
+fn import_data(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<Vec<Clip>> {
     let Some(path) = rfd::FileDialog::new()
         .set_title("导入 dudu 备份")
         .add_filter("JSON 文件", &["json"])
@@ -1291,34 +1363,38 @@ fn import_data(state: tauri::State<'_, AppState>) -> Result<Vec<Clip>> {
     }
     backup.settings.validate()?;
     let db = state.db.lock().map_err(err)?;
-    for c in backup.clipboard {
-        if c.id.is_empty()
-            || c.id.len() > 64
-            || !['t', 'i']
-                .iter()
-                .any(|_| c.kind == "text" || c.kind == "image")
-            || c.content.len() > 20 * 1024 * 1024
-            || c.source.len() > 512
-            || c.title.len() > 512
-        {
-            return Err("备份中包含不合法记录".into());
-        }
-        let preview = if c.kind == "image" {
-            image_preview(&c.content)?
+    // 剪贴板记录：校验+事务全部收在 Store::import_clips 内，任一条非法整体回滚。
+    db.import_clips(&backup.clipboard, backup.settings.limit, |c| {
+        if c.kind == "image" {
+            image_preview(&c.content)
         } else {
-            c.content.clone()
-        };
-        db.insert(&c, &preview, backup.settings.limit)?;
-    }
-    for t in backup.translations {
-        if t.id.len() > 128 || t.text.len() > 40_000 || t.result.len() > 120_000 {
-            return Err("翻译历史记录超出大小限制".into());
+            Ok(c.content.clone())
         }
-        db.cache(&t)?;
+    })?;
+    // 翻译缓存 + 设置：另一个短事务，失败同样整体回滚。
+    db.tx_begin();
+    let tail = (|| -> Result<()> {
+        for t in backup.translations {
+            if t.id.len() > 128 || t.text.len() > 40_000 || t.result.len() > 120_000 {
+                return Err("翻译历史记录超出大小限制".into());
+            }
+            db.cache(&t)?;
+        }
+        db.save_settings(&backup.settings)?;
+        Ok(())
+    })();
+    match tail {
+        Ok(()) => db.tx_commit(),
+        Err(e) => {
+            db.tx_rollback();
+            return Err(e);
+        }
     }
-    db.save_settings(&backup.settings)?;
     drop(db);
-    *state.settings.lock().map_err(err)? = backup.settings;
+    *state.settings.lock().map_err(err)? = backup.settings.clone();
+    // 导入后立即按备份里的快捷键重注册，否则快捷键仍映射旧值。
+    let _ = register_shortcuts(&app, &backup.settings);
+    let _ = refresh_tray(&app, &backup.settings);
     state.clips(false)
 }
 
@@ -1427,6 +1503,18 @@ fn start_listener(app: tauri::AppHandle, db_path: PathBuf) {
                 if settings.paused || !settings.consent {
                     continue;
                 }
+                // 划词偷剪贴板期间：只同步 last_*，绝不入库。
+                if state.clipboard_suppress.load(Ordering::Acquire) {
+                    if let Ok(t) = clipboard.get_text() {
+                        last_text = t;
+                    }
+                    if settings.capture_images {
+                        if let Ok(img) = clipboard.get_image() {
+                            last_image = format!("{:x}", Sha256::digest(img.bytes.as_ref()));
+                        }
+                    }
+                    continue;
+                }
                 if let Ok(text) = clipboard.get_text() {
                     let text = text.trim_end_matches('\0').to_owned();
                     if !text.trim().is_empty()
@@ -1456,9 +1544,13 @@ fn start_listener(app: tauri::AppHandle, db_path: PathBuf) {
                         if let Some(s) = app.try_state::<AppState>() {
                             if let Ok(db) = s.db.lock() {
                                 if !db.is_recent_duplicate("text", &text, 300_000) {
-                                    let _ = db.insert(&c, "", settings.limit);
-                                    last_text = text.clone();
-                                    let _ = app.emit("clips", s.clips(false).unwrap_or_default());
+                                    let inserted = db.insert(&c, "", settings.limit).is_ok();
+                                    // 先释放 db 锁，再取列表推送：杜绝锁内二次加锁同一 Mutex。
+                                    drop(db);
+                                    if inserted {
+                                        last_text = text;
+                                        let _ = app.emit("clips", s.clips(false).unwrap_or_default());
+                                    }
                                 }
                             }
                         }
@@ -1506,12 +1598,20 @@ fn start_listener(app: tauri::AppHandle, db_path: PathBuf) {
                                 let preview = image_preview(&data).unwrap_or_default();
                                 if let Some(s) = app.try_state::<AppState>() {
                                     if let Ok(db) = s.db.lock() {
-                                        if db.insert(&c, &preview, settings.limit).is_ok() {
+                                        // 与文本分支对齐：300s 窗口内 DB 级去重，重启后不再重复入库。
+                                        if db.is_recent_duplicate("image", &data, 300_000) {
                                             last_image = hash;
-                                            let _ = app.emit(
-                                                "clips",
-                                                s.clips(false).unwrap_or_default(),
-                                            );
+                                        } else {
+                                            let ok =
+                                                db.insert(&c, &preview, settings.limit).is_ok();
+                                            drop(db);
+                                            if ok {
+                                                last_image = hash;
+                                                let _ = app.emit(
+                                                    "clips",
+                                                    s.clips(false).unwrap_or_default(),
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -1662,10 +1762,9 @@ fn build_tray<R: tauri::Runtime>(app: &tauri::App<R>, settings: &Settings) -> ta
                 });
             }
             "window" => {
-                let a = app.clone();
-                std::thread::spawn(move || {
-                    let _ = capture_start(&a, "window", 0, None);
-                });
+                // 与快捷键路径一致：先抬主窗再让前端打开窗口列表。
+                let _ = show_main(app);
+                let _ = app.emit("open-window-picker");
             }
             "fullscreen" => {
                 let a = app.clone();
@@ -1754,6 +1853,7 @@ pub fn run() {
                 capture: RwLock::new(None),
                 capture_cache: RwLock::new(None),
                 data_dir: base.clone(),
+                clipboard_suppress: AtomicBool::new(false),
             });
             let icon_errors = register_shortcuts(app.handle(), &settings);
             let _ = build_tray(app, &settings);
@@ -1763,12 +1863,18 @@ pub fn run() {
                     format!("部分快捷键被其他应用占用：{}", icon_errors.join("；")),
                 );
             }
-            start_listener(app.handle().clone(), db_path);
+            // macOS 暂未实现前台应用探测：剪贴板记录整体停用并向前端广播状态。
+            let status = clipboard_status_payload();
+            let _ = app.emit("clipboard-status", status);
+            if CLIPBOARD_ENABLED {
+                start_listener(app.handle().clone(), db_path);
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             status,
             get_settings,
+            clipboard_status,
             save_settings,
             list_clips,
             favorite_clip,

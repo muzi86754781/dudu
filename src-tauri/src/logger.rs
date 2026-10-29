@@ -64,8 +64,9 @@ pub fn log_raw(level: &str, target: &str, message: &str) {
     #[cfg(debug_assertions)]
     eprint!("{line}");
 
-    // Write to primary log
+    // Write to primary log（超过 2MB 轮转一次：dudu.log → dudu.log.1）
     let p1 = get_primary_log_file();
+    rotate_if_needed(&p1);
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&p1) {
         let _ = f.write_all(line.as_bytes());
         let _ = f.flush();
@@ -77,6 +78,18 @@ pub fn log_raw(level: &str, target: &str, message: &str) {
         let _ = f.write_all(line.as_bytes());
         let _ = f.flush();
     }
+}
+
+/// 主日志超过 2MB 时滚动一次（旧文件改名为 .1，覆盖已有的 .1）。
+fn rotate_if_needed(p: &std::path::Path) {
+    const MAX: u64 = 2 * 1024 * 1024;
+    let Ok(meta) = fs::metadata(p) else { return };
+    if meta.len() <= MAX {
+        return;
+    }
+    let old = p.with_extension("log.1");
+    let _ = fs::remove_file(&old);
+    let _ = fs::rename(p, &old);
 }
 
 fn chrono_timestamp() -> String {

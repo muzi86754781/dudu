@@ -176,6 +176,13 @@ pub struct Capture {
     pub height: u32,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipboardStatus {
+    pub enabled: bool,
+    pub reason: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
